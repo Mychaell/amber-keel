@@ -22,7 +22,7 @@ jobs:
           OPENSEA_API_KEY: ${{ secrets.OPENSEA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          COLLECTION_LIMIT: "30"
+          COLLECTION_LIMIT: "12"
           REQUEST_GAP: "0.8"
       - name: keep
         run: |

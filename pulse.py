@@ -10,7 +10,16 @@ from pathlib import Path
 import requests
 
 API = "https://api.opensea.io"
-CHAIN = "robinhood"
+CHAINS = (
+    "robinhood",
+    "base",
+    "ethereum",
+    "hyperevm",
+    "polygon",
+    "ink",
+    "arbitrum",
+    "optimism",
+)
 DROP_TYPES = ("featured", "upcoming", "recently_minted")
 PUBLIC_HINTS = ("public", "fcfs", "open sale", "open mint", "general")
 PRIVATE_HINTS = (
@@ -32,7 +41,7 @@ PRIVATE_TYPES = {"presale", "signed_presale", "allowlist", "whitelist", "private
 API_KEY = os.getenv("OPENSEA_API_KEY", "").strip()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-COLLECTION_LIMIT = int(os.getenv("COLLECTION_LIMIT", "30"))
+COLLECTION_LIMIT = int(os.getenv("COLLECTION_LIMIT", "12"))
 REQUEST_GAP = float(os.getenv("REQUEST_GAP", "0.8"))
 STATE_PATH = Path(os.getenv("STATE_PATH", "seen.json"))
 LAST_CALL = 0.0
@@ -154,19 +163,38 @@ def rows_from(payload):
 def list_drops():
     found = []
     seen = set()
-    for drop_type in DROP_TYPES:
-        payload = get_json("/api/v2/drops", {"type": drop_type, "limit": 100, "chains": CHAIN})
-        for row in rows_from(payload):
-            slug = slug_of(row)
-            if not slug or slug in seen:
+    collections = []
+    for chain in CHAINS:
+        for drop_type in DROP_TYPES:
+            try:
+                payload = get_json(
+                    "/api/v2/drops",
+                    {"type": drop_type, "limit": 50, "chains": chain},
+                )
+            except requests.HTTPError as exc:
+                print(f"{chain} {drop_type}: {exc}")
                 continue
-            seen.add(slug)
-            found.append(row if row.get("stages") else get_json(f"/api/v2/drops/{slug}"))
-    payload = get_json(
-        "/api/v2/collections",
-        {"chain": CHAIN, "order_by": "created_date", "limit": COLLECTION_LIMIT},
-    )
-    return found, seen, rows_from(payload)
+            for row in rows_from(payload):
+                slug = slug_of(row)
+                if not slug or slug in seen:
+                    continue
+                seen.add(slug)
+                detail = row if row.get("stages") else get_json(f"/api/v2/drops/{slug}")
+                if detail:
+                    detail["chain"] = detail.get("chain") or chain
+                    found.append(detail)
+        try:
+            payload = get_json(
+                "/api/v2/collections",
+                {"chain": chain, "order_by": "created_date", "limit": COLLECTION_LIMIT},
+            )
+        except requests.HTTPError as exc:
+            print(f"{chain} collections: {exc}")
+            continue
+        for row in rows_from(payload):
+            row["chain"] = chain
+            collections.append(row)
+    return found, seen, collections
 
 
 def send(text):
@@ -195,7 +223,8 @@ def consider(drop, state):
         if key in state["sent"]:
             continue
         label = str(stage.get("label") or stage.get("name") or "Public")
-        send(f"{name_of(drop)}\n{label} · free\nhttps://opensea.io/collection/{slug}")
+        chain = drop.get("chain") or "unknown"
+        send(f"{name_of(drop)}\n{chain} · {label} · free\nhttps://opensea.io/collection/{slug}")
         state["sent"][key] = now
         sent += 1
         print(f"sent {slug} {label}")
@@ -223,6 +252,7 @@ def scan(state):
             misses[slug] = now
             continue
         if detail:
+            detail["chain"] = detail.get("chain") or row.get("chain")
             count += consider(detail, state)
     save_state(state)
     print(f"done, new messages: {count}")
