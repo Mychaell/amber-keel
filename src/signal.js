@@ -8,6 +8,7 @@ function chainLabel(chain) {
     ethereum: "Ethereum",
     ink: "Ink",
     arc: "Arc",
+    hyperevm: "HyperEVM",
   };
   return names[String(chain || "").toLowerCase()] || String(chain || "Unknown");
 }
