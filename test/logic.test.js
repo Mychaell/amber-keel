@@ -112,6 +112,68 @@ test("wallet limit above 10 is filtered from Telegram", async () => {
   assert.equal(marked, false);
 });
 
+test("supply of 150 still qualifies for alerting", async () => {
+  let telegramCalls = 0;
+  const state = {
+    hasAlert: async () => false,
+    markAlert: async () => {},
+  };
+  const telegram = async () => { telegramCalls += 1; };
+  const sent = await notifyCandidate({
+    drop: { ...drop, max_supply: "150" },
+    stage: stage(),
+    state,
+    env: {},
+    nowSec: NOW,
+    minAlertSupply: 150,
+    telegram,
+  });
+  assert.equal(sent, true);
+  assert.equal(telegramCalls, 1);
+});
+
+test("supply below 150 is filtered from Telegram", async () => {
+  let telegramCalls = 0;
+  let marked = false;
+  const state = {
+    hasAlert: async () => false,
+    markAlert: async () => { marked = true; },
+  };
+  const telegram = async () => { telegramCalls += 1; };
+  const sent = await notifyCandidate({
+    drop: { ...drop, max_supply: "149" },
+    stage: stage(),
+    state,
+    env: {},
+    nowSec: NOW,
+    minAlertSupply: 150,
+    telegram,
+  });
+  assert.equal(sent, false);
+  assert.equal(telegramCalls, 0);
+  assert.equal(marked, false);
+});
+
+test("unknown max supply is not filtered", async () => {
+  let telegramCalls = 0;
+  const state = {
+    hasAlert: async () => false,
+    markAlert: async () => {},
+  };
+  const telegram = async () => { telegramCalls += 1; };
+  const sent = await notifyCandidate({
+    drop: { ...drop, max_supply: null },
+    stage: stage(),
+    state,
+    env: {},
+    nowSec: NOW,
+    minAlertSupply: 150,
+    telegram,
+  });
+  assert.equal(sent, true);
+  assert.equal(telegramCalls, 1);
+});
+
 test("different stage UUID on the same collection generates another alert", async () => {
   const sent = new Set();
   let telegramCalls = 0;
