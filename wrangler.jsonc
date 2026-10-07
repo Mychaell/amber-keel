@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "amber-keel",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-07",
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": []
+  },
+  "vars": {
+    "TARGET_CHAINS": "robinhood,base,optimism,ethereum,ink,arc",
+    "DETAIL_REFRESH_SECONDS": "300",
+    "MAX_DETAILS_PER_SCAN": "8",
+    "COLLECTION_SWEEP_SECONDS": "300",
+    "COLLECTION_LIMIT": "12",
+    "MAX_FALLBACK_DETAILS": "12",
+    "MISS_TTL_SECONDS": "21600",
+    "ALERT_FREE_ALLOWLISTS": "false"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "amber-keel",
+      "database_id": "0a2c8db7-7e52-4b7d-940e-62d03593e59a"
+    }
+  ]
+}

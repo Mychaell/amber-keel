@@ -1,12 +1,10 @@
 name: tide
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   tide:
@@ -24,12 +22,3 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           COLLECTION_LIMIT: "12"
           REQUEST_GAP: "0.8"
-      - name: keep
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f seen.json
-          if ! git diff --cached --quiet; then
-            git commit -m "keep"
-            git push
-          fi

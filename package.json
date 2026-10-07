@@ -1,0 +1,16 @@
+{
+  "name": "amber-keel",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/tide.js && node --check src/signal.js && node --check src/state.js && node --check src/current.js && node --check src/util.js",
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 migrations apply DB --local",
+    "db:remote": "wrangler d1 migrations apply DB --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.45.0"
+  }
+}
