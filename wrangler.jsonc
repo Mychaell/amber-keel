@@ -17,7 +17,8 @@
     "COLLECTION_LIMIT": "12",
     "MAX_FALLBACK_DETAILS": "12",
     "MISS_TTL_SECONDS": "21600",
-    "ALERT_FREE_ALLOWLISTS": "false"
+    "ALERT_FREE_ALLOWLISTS": "false",
+    "MAX_ALERT_PER_WALLET": "10"
   },
   "d1_databases": [
     {
