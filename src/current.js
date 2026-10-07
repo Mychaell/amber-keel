@@ -37,5 +37,6 @@ export function getConfig(env) {
     maxFallbackDetails: intVar(env, "MAX_FALLBACK_DETAILS", 12, 0, 100),
     missTtlSeconds: intVar(env, "MISS_TTL_SECONDS", 21600, 300, 604800),
     alertFreeAllowlists: boolVar(env, "ALERT_FREE_ALLOWLISTS", false),
+    maxAlertPerWallet: intVar(env, "MAX_ALERT_PER_WALLET", 10, 1, 1000000),
   };
 }
