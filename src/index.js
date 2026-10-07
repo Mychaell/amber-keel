@@ -85,7 +85,7 @@ async function calendarScan({ api, state, config, env, nowSec }) {
   let sent = 0;
   for (const drop of drops) {
     sent += await notifyStages(drop, [drop.active_stage, drop.next_stage], {
-      state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet,
+      state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
     });
   }
 
@@ -107,7 +107,7 @@ async function calendarScan({ api, state, config, env, nowSec }) {
     try {
       const detail = await api.getDrop(drop.collection_slug);
       sent += await notifyStages(detail, detail.stages || [], {
-        state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet,
+        state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
       });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(detail.collection_slug);
@@ -173,7 +173,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries }) {
       const detail = await api.getDrop(slug);
       if (!config.chains.includes(detail.chain)) return;
       sent += await notifyStages(detail, detail.stages || [], {
-        state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet,
+        state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
       });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(slug);
