@@ -69,6 +69,7 @@ export async function notifyCandidate({
   nowSec,
   allowFreeAllowlists = false,
   maxAlertPerWallet = 10,
+  minAlertSupply = 150,
   telegram = sendTelegram,
 }) {
   if (!isFreePublicStage(stage, nowSec, allowFreeAllowlists)) return false;
@@ -77,6 +78,12 @@ export async function notifyCandidate({
   if (rawLimit != null && rawLimit !== "") {
     const perWallet = Number(rawLimit);
     if (Number.isFinite(perWallet) && perWallet > maxAlertPerWallet) return false;
+  }
+
+  const rawSupply = drop?.max_supply;
+  if (rawSupply != null && rawSupply !== "") {
+    const maxSupply = Number(rawSupply);
+    if (Number.isFinite(maxSupply) && maxSupply < minAlertSupply) return false;
   }
   const key = alertKey(drop, stage);
   if (await state.hasAlert(key)) return false;
