@@ -61,14 +61,22 @@ async function maybeValidateChains({ api, state, config, nowSec }) {
 }
 
 async function calendarScan({ api, state, config, env, nowSec }) {
+  let feedSuccesses = 0;
+  const feedErrors = [];
   const pages = await Promise.all(DROP_TYPES.map(async (type) => {
     try {
-      return await api.listDrops(type, config.chains);
+      const rows = await api.listDrops(type, config.chains);
+      feedSuccesses += 1;
+      return rows;
     } catch (err) {
+      feedErrors.push(`${type}: ${err.message}`);
       console.warn(`drops ${type}: ${err.message}`);
       return [];
     }
   }));
+  if (feedSuccesses === 0) {
+    throw new Error(`all OpenSea drop feeds failed: ${feedErrors.join(" | ")}`);
+  }
   const summaries = new Map();
   for (const rows of pages) for (const row of rows) mergeSummary(summaries, row);
   const drops = [...summaries.values()];
@@ -223,7 +231,7 @@ export default {
       });
     }
 
-    if (url.pathname !== "/run" && url.pathname !== "/test-telegram") {
+    if (url.pathname !== "/run" && url.pathname !== "/test-telegram" && url.pathname !== "/diag") {
       return jsonResponse({ ok: false, error: "not found" }, 404);
     }
 
@@ -243,6 +251,36 @@ export default {
       if (url.pathname === "/test-telegram") {
         await sendTelegram(env, "amber-keel test ✅");
         return jsonResponse({ ok: true, telegram: "sent" });
+      }
+
+      if (url.pathname === "/diag") {
+        const config = getConfig(env);
+        const api = new Tide({ apiKey: env.OPENSEA_API_KEY });
+        const checks = {};
+        try {
+          const chains = await api.getChains();
+          checks.chains = {
+            ok: true,
+            count: (chains.chains || []).length,
+            targets: config.chains.map((chain) => ({
+              chain,
+              supported: (chains.chains || []).some((row) => row.chain === chain),
+            })),
+          };
+        } catch (err) {
+          checks.chains = { ok: false, error: err.message };
+        }
+
+        for (const type of DROP_TYPES) {
+          try {
+            const rows = await api.listDrops(type, config.chains);
+            checks[type] = { ok: true, count: rows.length };
+          } catch (err) {
+            checks[type] = { ok: false, error: err.message };
+          }
+        }
+
+        return jsonResponse({ ok: true, checks });
       }
 
       const result = await runScan(env);
