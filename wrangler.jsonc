@@ -7,7 +7,7 @@
     "enabled": true
   },
   "triggers": {
-    "crons": []
+    "crons": ["* * * * *"]
   },
   "vars": {
     "TARGET_CHAINS": "robinhood,base,optimism,ethereum,ink,arc",
