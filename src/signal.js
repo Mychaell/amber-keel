@@ -61,8 +61,23 @@ export async function sendTelegram(env, text, fetchImpl = fetch) {
   }
 }
 
-export async function notifyCandidate({ drop, stage, state, env, nowSec, allowFreeAllowlists = false, telegram = sendTelegram }) {
+export async function notifyCandidate({
+  drop,
+  stage,
+  state,
+  env,
+  nowSec,
+  allowFreeAllowlists = false,
+  maxAlertPerWallet = 10,
+  telegram = sendTelegram,
+}) {
   if (!isFreePublicStage(stage, nowSec, allowFreeAllowlists)) return false;
+
+  const rawLimit = stage?.max_per_wallet;
+  if (rawLimit != null && rawLimit !== "") {
+    const perWallet = Number(rawLimit);
+    if (Number.isFinite(perWallet) && perWallet > maxAlertPerWallet) return false;
+  }
   const key = alertKey(drop, stage);
   if (await state.hasAlert(key)) return false;
 
