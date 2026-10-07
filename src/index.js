@@ -1,5 +1,5 @@
 import { getConfig } from "./current.js";
-import { notifyCandidate } from "./signal.js";
+import { notifyCandidate, sendTelegram } from "./signal.js";
 import { createState } from "./state.js";
 import { OpenSeaNotFound, Tide } from "./tide.js";
 import { dropKey, mapLimit } from "./util.js";
@@ -193,15 +193,63 @@ export async function runScan(env, deps = {}) {
   return { alerts: first.sent + extra, drops: first.summaries.size };
 }
 
+function jsonResponse(body, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+function isAuthorized(request, env) {
+  if (!env.CONTROL_TOKEN) return false;
+  return request.headers.get("authorization") === `Bearer ${env.CONTROL_TOKEN}`;
+}
+
 export default {
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(runScan(env).catch((err) => console.error("scan failed:", err.message)));
   },
 
-  async fetch() {
-    return new Response("amber-keel", {
-      status: 200,
-      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
-    });
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/" && request.method === "GET") {
+      return new Response("amber-keel", {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+
+    if (url.pathname !== "/run" && url.pathname !== "/test-telegram") {
+      return jsonResponse({ ok: false, error: "not found" }, 404);
+    }
+
+    if (request.method !== "POST") {
+      return jsonResponse({ ok: false, error: "method not allowed" }, 405);
+    }
+
+    if (!env.CONTROL_TOKEN) {
+      return jsonResponse({ ok: false, error: "manual control is not configured" }, 503);
+    }
+
+    if (!isAuthorized(request, env)) {
+      return jsonResponse({ ok: false, error: "unauthorized" }, 401);
+    }
+
+    try {
+      if (url.pathname === "/test-telegram") {
+        await sendTelegram(env, "amber-keel test ✅");
+        return jsonResponse({ ok: true, telegram: "sent" });
+      }
+
+      const result = await runScan(env);
+      return jsonResponse({ ok: true, ...result });
+    } catch (err) {
+      console.error(`manual ${url.pathname} failed:`, err.message);
+      return jsonResponse({ ok: false, error: err.message }, 500);
+    }
   },
 };
