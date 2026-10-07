@@ -1,4 +1,4 @@
-const DEFAULT_CHAINS = ["robinhood", "base", "optimism", "ethereum", "ink", "arc"];
+const DEFAULT_CHAINS = ["robinhood", "base", "optimism", "ethereum", "ink", "arc", "hyperevm"];
 
 function intVar(env, name, fallback, min, max) {
   const raw = env[name];
