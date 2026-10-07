@@ -70,6 +70,48 @@ test("identical stage UUID does not generate a second alert", async () => {
   assert.equal(telegramCalls, 1);
 });
 
+test("wallet limit of 10 still qualifies for alerting", async () => {
+  let telegramCalls = 0;
+  const state = {
+    hasAlert: async () => false,
+    markAlert: async () => {},
+  };
+  const telegram = async () => { telegramCalls += 1; };
+  const sent = await notifyCandidate({
+    drop,
+    stage: stage({ max_per_wallet: "10" }),
+    state,
+    env: {},
+    nowSec: NOW,
+    maxAlertPerWallet: 10,
+    telegram,
+  });
+  assert.equal(sent, true);
+  assert.equal(telegramCalls, 1);
+});
+
+test("wallet limit above 10 is filtered from Telegram", async () => {
+  let telegramCalls = 0;
+  let marked = false;
+  const state = {
+    hasAlert: async () => false,
+    markAlert: async () => { marked = true; },
+  };
+  const telegram = async () => { telegramCalls += 1; };
+  const sent = await notifyCandidate({
+    drop,
+    stage: stage({ max_per_wallet: "11" }),
+    state,
+    env: {},
+    nowSec: NOW,
+    maxAlertPerWallet: 10,
+    telegram,
+  });
+  assert.equal(sent, false);
+  assert.equal(telegramCalls, 0);
+  assert.equal(marked, false);
+});
+
 test("different stage UUID on the same collection generates another alert", async () => {
   const sent = new Set();
   let telegramCalls = 0;
