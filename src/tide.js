@@ -9,7 +9,7 @@ function retryDelaySeconds(response, attempt) {
 }
 
 export class Tide {
-  constructor({ apiKey, fetchImpl = fetch, sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)), baseUrl = BASE }) {
+  constructor({ apiKey, fetchImpl = (input, init) => globalThis.fetch(input, init), sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)), baseUrl = BASE }) {
     this.apiKey = apiKey;
     this.fetchImpl = fetchImpl;
     this.sleepImpl = sleepImpl;
