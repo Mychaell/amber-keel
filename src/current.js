@@ -31,6 +31,12 @@ export function getConfig(env) {
   return {
     chains: [...new Set(chains)],
     detailRefreshSeconds: intVar(env, "DETAIL_REFRESH_SECONDS", 300, 60, 86400),
+    stabilityMinSeconds: intVar(env, "STABILITY_MIN_SECONDS", 600, 1, 86400),
+    stabilityMinObservations: intVar(env, "STABILITY_MIN_OBSERVATIONS", 3, 1, 1000),
+    upcomingAlertWindowSeconds: intVar(env, "UPCOMING_ALERT_WINDOW_SECONDS", 600, 1, 86400),
+    liveMinObservations: intVar(env, "LIVE_MIN_OBSERVATIONS", 2, 1, 1000),
+    watchRefreshSeconds: intVar(env, "WATCH_REFRESH_SECONDS", 60, 1, 86400),
+    watchWindowSeconds: intVar(env, "WATCH_WINDOW_SECONDS", 1800, 1, 86400),
     maxDetailsPerScan: intVar(env, "MAX_DETAILS_PER_SCAN", 8, 0, 100),
     collectionSweepSeconds: intVar(env, "COLLECTION_SWEEP_SECONDS", 300, 60, 86400),
     collectionLimit: intVar(env, "COLLECTION_LIMIT", 12, 1, 100),

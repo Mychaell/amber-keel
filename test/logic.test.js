@@ -1,8 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isFreePublicStage, parseIsoSeconds, stageStatus } from "../src/util.js";
-import { buildMessage, notifyCandidate } from "../src/signal.js";
+import { buildMessage, notifyCandidate as realNotifyCandidate } from "../src/signal.js";
 import { Tide } from "../src/tide.js";
+
+// Existing filter tests start with a watch that has already earned live stability.
+async function notifyCandidate(args) {
+  let watch = null;
+  args.state.getStageWatch = async () => watch;
+  args.state.saveStageWatch = async row => { watch = row; };
+  await realNotifyCandidate({ ...args, stage: { ...args.stage, start_time: "2026-10-07T11:00:00Z" }, nowSec: args.nowSec - 60 });
+  return realNotifyCandidate({ ...args, stage: { ...args.stage, start_time: "2026-10-07T11:00:00Z" } });
+}
 
 const NOW = Math.floor(Date.parse("2026-10-07T12:00:00Z") / 1000);
 

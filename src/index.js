@@ -1,8 +1,9 @@
+import { detailRefreshSeconds, observeStage } from "./watch.js";
 import { getConfig } from "./current.js";
 import { notifyCandidate, sendTelegram } from "./signal.js";
 import { createState } from "./state.js";
 import { OpenSeaNotFound, Tide } from "./tide.js";
-import { dropKey, mapLimit } from "./util.js";
+import { dropKey, mapLimit, parseWei } from "./util.js";
 
 const DROP_TYPES = ["featured", "upcoming", "recently_minted"];
 
@@ -60,7 +61,7 @@ async function maybeValidateChains({ api, state, config, nowSec }) {
   }
 }
 
-async function calendarScan({ api, state, config, env, nowSec }) {
+async function calendarScan({ api, state, config, env, nowSec, scanId }) {
   let feedSuccesses = 0;
   const feedErrors = [];
   const pages = await Promise.all(DROP_TYPES.map(async (type) => {
@@ -83,11 +84,30 @@ async function calendarScan({ api, state, config, env, nowSec }) {
   console.log(`calendar ${drops.length} unique drops`);
 
   let sent = 0;
+  // Record summaries before details, but defer Telegram decisions until details finish.
+  // Conflicting sources reset stability without adding a second scan observation.
   for (const drop of drops) {
-    sent += await notifyStages(drop, [drop.active_stage, drop.next_stage], {
-      state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
-    });
+    const stages = new Map([drop.active_stage, drop.next_stage].filter(stage => stage?.uuid).map(stage => [stage.uuid, stage]));
+    for (const stage of stages.values()) {
+      const price = parseWei(stage.price);
+      if (price != null && price !== 0n) {
+        sent += await notifyStages(drop, [stage], { state, env, nowSec, scanId, config });
+      } else {
+        await observeStage({ drop, stage, state, nowSec, scanId });
+      }
+    }
   }
+  const alertedWatches = await state.getAlertedWatches();
+  for (const watch of alertedWatches) {
+    if (watch.last_end_time != null && Number(watch.last_end_time) <= nowSec) continue;
+    const key = `${watch.chain}:${watch.slug}`;
+    if (!summaries.has(key)) {
+      const drop = { chain: watch.chain, collection_slug: watch.slug };
+      summaries.set(key, drop);
+      drops.push(drop);
+    }
+  }
+  const observations = new Map(drops.map(drop => [dropKey(drop), { drop, stages: [drop.active_stage, drop.next_stage] }]));
 
   const keys = drops.map(dropKey);
   const caches = await state.getCaches(keys);
@@ -97,7 +117,7 @@ async function calendarScan({ api, state, config, env, nowSec }) {
       if (!cached) return true;
       const changed = (cached.active_uuid || null) !== (drop.active_stage?.uuid || null)
         || (cached.next_uuid || null) !== (drop.next_stage?.uuid || null);
-      const stale = nowSec - Number(cached.last_detail_at || 0) >= config.detailRefreshSeconds;
+      const stale = nowSec - Number(cached.last_detail_at || 0) >= detailRefreshSeconds(drop, alertedWatches, nowSec, config);
       return changed || stale;
     })
     .sort((a, b) => Number(a.cached?.last_detail_at || 0) - Number(b.cached?.last_detail_at || 0))
@@ -106,9 +126,7 @@ async function calendarScan({ api, state, config, env, nowSec }) {
   await mapLimit(due, 4, async ({ drop }) => {
     try {
       const detail = await api.getDrop(drop.collection_slug);
-      sent += await notifyStages(detail, detail.stages || [], {
-        state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
-      });
+      observations.set(dropKey(detail), { drop: detail, stages: detail.stages || [] });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(detail.collection_slug);
     } catch (err) {
@@ -131,10 +149,16 @@ async function calendarScan({ api, state, config, env, nowSec }) {
     }
   });
 
+  for (const { drop, stages } of observations.values()) {
+    sent += await notifyStages(drop, stages, {
+      state, env, nowSec, scanId, config, allowFreeAllowlists: config.alertFreeAllowlists,
+      maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
+    });
+  }
   return { sent, summaries };
 }
 
-async function collectionSweep({ api, state, config, env, nowSec, summaries }) {
+async function collectionSweep({ api, state, config, env, nowSec, summaries, scanId }) {
   const raw = await state.getSetting("collection_sweep_at");
   const last = Number(raw || 0);
   if (nowSec - last < config.collectionSweepSeconds || config.maxFallbackDetails === 0) return 0;
@@ -173,7 +197,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries }) {
       const detail = await api.getDrop(slug);
       if (!config.chains.includes(detail.chain)) return;
       sent += await notifyStages(detail, detail.stages || [], {
-        state, env, nowSec, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
+        state, env, nowSec, scanId, config, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
       });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(slug);
@@ -191,12 +215,13 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries }) {
 export async function runScan(env, deps = {}) {
   const config = getConfig(env);
   const nowSec = deps.nowSec ?? Math.floor(Date.now() / 1000);
+  const scanId = deps.scanId ?? crypto.randomUUID();
   const state = deps.state || createState(env.DB);
   const api = deps.api || new Tide({ apiKey: env.OPENSEA_API_KEY });
 
   await maybeValidateChains({ api, state, config, nowSec });
-  const first = await calendarScan({ api, state, config, env, nowSec });
-  const extra = await collectionSweep({ api, state, config, env, nowSec, summaries: first.summaries });
+  const first = await calendarScan({ api, state, config, env, nowSec, scanId });
+  const extra = await collectionSweep({ api, state, config, env, nowSec, summaries: first.summaries, scanId });
   console.log(`done alerts=${first.sent + extra}`);
   return { alerts: first.sent + extra, drops: first.summaries.size };
 }

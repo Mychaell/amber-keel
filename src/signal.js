@@ -1,4 +1,5 @@
-import { alertKey, fmtInteger, fmtUtc, isFreePublicStage, stageStatus } from "./util.js";
+import { observeStage, isStable } from "./watch.js";
+import { alertKey, fmtInteger, fmtUtc, isFreePublicStage, stageStatus, parseWei } from "./util.js";
 
 function chainLabel(chain) {
   const names = {
@@ -70,9 +71,27 @@ export async function notifyCandidate({
   allowFreeAllowlists = false,
   maxAlertPerWallet = 10,
   minAlertSupply = 150,
+  scanId,
+  config = { stabilityMinSeconds: 600, stabilityMinObservations: 3, upcomingAlertWindowSeconds: 600, liveMinObservations: 2 },
   telegram = sendTelegram,
 }) {
-  if (!isFreePublicStage(stage, nowSec, allowFreeAllowlists)) return false;
+  if (!stage?.uuid) return false;
+  const key = alertKey(drop, stage);
+  const watch = await observeStage({ drop, stage, state, nowSec, scanId });
+  const alerted = await state.hasAlert(key);
+  const price = parseWei(stage.price);
+  if (alerted && price != null && price !== 0n && !watch.paid_warning_sent) {
+    try {
+      await telegram(env, ["⚠️ MINT CHANGED", drop.collection_name || drop.collection_slug,
+        `Chain: ${chainLabel(drop.chain)}`, "Price changed: FREE → PAID", "Do not mint until rechecked."].join("\n"));
+    } catch (err) {
+      console.error(`telegram warning failed ${key}: ${err.message}`);
+      return false;
+    }
+    await state.saveStageWatch({ ...watch, paid_warning_sent: 1 });
+    return true;
+  }
+  if (alerted || !isFreePublicStage(stage, nowSec, allowFreeAllowlists) || !isStable(watch, stage, nowSec, config)) return false;
 
   const rawLimit = stage?.max_per_wallet;
   if (rawLimit != null && rawLimit !== "") {
@@ -85,8 +104,6 @@ export async function notifyCandidate({
     const maxSupply = Number(rawSupply);
     if (Number.isFinite(maxSupply) && maxSupply < minAlertSupply) return false;
   }
-  const key = alertKey(drop, stage);
-  if (await state.hasAlert(key)) return false;
 
   const message = buildMessage(drop, stage, nowSec);
   try {

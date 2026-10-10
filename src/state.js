@@ -1,5 +1,22 @@
 export function createState(db) {
   return {
+    async getStageWatch(key) {
+      return db.prepare("SELECT * FROM stage_watch WHERE stage_key = ?1").bind(key).first();
+    },
+
+    async saveStageWatch(row) {
+      const columns = Object.keys(row);
+      await db.prepare(`INSERT INTO stage_watch (${columns.join(",")})
+        VALUES (${columns.map((_, i) => `?${i + 1}`).join(",")})
+        ON CONFLICT(stage_key) DO UPDATE SET ${columns.filter(x => x !== "stage_key").map(x => `${x} = excluded.${x}`).join(",")}`)
+        .bind(...columns.map(x => row[x])).run();
+    },
+
+    async getAlertedWatches() {
+      const result = await db.prepare(`SELECT w.* FROM stage_watch w JOIN alerts a ON a.alert_key = w.stage_key`).all();
+      return result.results || [];
+    },
+
     async hasAlert(key) {
       const row = await db.prepare("SELECT 1 AS yes FROM alerts WHERE alert_key = ?1 LIMIT 1").bind(key).first();
       return Boolean(row);
