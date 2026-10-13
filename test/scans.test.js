@@ -287,3 +287,50 @@ for (const [name, changes] of Object.entries({ wallet: { max_per_wallet: '11' },
     assert.equal((await f.discovery(300, practice)).alerts, 1);
   });
 }
+
+for (const practiceMode of ['true', 'false']) {
+  for (const alerted of [false, true]) {
+    test(`authoritative sold-out watch closes with history intact, practice=${practiceMode}, alerted=${alerted}`, async () => {
+      const f = fixture();
+      const mode = { PRACTICE_MODE: practiceMode };
+      const live = { ...stage, start_time: iso(now - 7200) };
+      // Seed a watch without alerting, then exercise both alert states.
+      f.set({ ...drop, next_stage: live, stages: [live] });
+      await f.discovery();
+      const key = 'base:test:a';
+      if (alerted) await f.state.markAlert({ key, chain: 'base', slug: 'test', stageUuid: 'a', sentAt: now });
+      const before = await f.state.getStageWatch(key);
+      f.set({ ...drop, total_supply: 150, next_stage: live, stages: [live] });
+      f.calls.details = [];
+      assert.equal((await f.watch(60, mode)).alerts, 0);
+      assert.deepEqual({ ...await f.state.getStageWatch(key) }, { ...before, last_end_time: String(now + 60) });
+      assert.equal(await f.state.hasAlert(key), alerted);
+      assert.equal((await f.watch(120, mode)).candidates, 0);
+      assert.deepEqual(f.calls.details, ['test']);
+      await f.discovery(300, mode);
+      assert.equal((await f.watch(360, mode)).candidates, 0);
+      assert.equal((await f.state.getStageWatch(key)).first_seen_at, before.first_seen_at);
+    });
+  }
+  for (const total_supply of [150, 151]) {
+    test(`sold-out discovery rejects without extra requests, total=${total_supply}, practice=${practiceMode}`, async () => {
+      const f = fixture(); const live = { ...stage, start_time: iso(now - 7200) };
+      f.set({ ...drop, total_supply, next_stage: live, stages: [live] });
+      assert.equal((await f.discovery(0, { PRACTICE_MODE: practiceMode })).alerts, 0);
+      assert.equal(await f.state.getStageWatch('base:test:a'), null);
+      assert.deepEqual(f.calls.details, []);
+    });
+  }
+}
+
+test('sold-out authoritative discovery closes existing watches even when detail omits the UUID', async () => {
+  const f = fixture(); await f.discovery();
+  const before = await f.state.getStageWatch('base:test:a');
+  // Discovery summary still exposes the stage, while getDrop is authoritative.
+  f.api.getDrop = async () => ({ ...drop, total_supply: 150, stages: [] });
+  await f.discovery(300, practice);
+  const after = await f.state.getStageWatch('base:test:a');
+  assert.equal(after.last_end_time, String(now + 300));
+  assert.equal(after.first_seen_at, before.first_seen_at);
+  assert.equal((await f.watch(360, practice)).candidates, 0);
+});

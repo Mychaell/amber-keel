@@ -1,5 +1,5 @@
 import { observeStage, isStable } from "./watch.js";
-import { alertKey, fmtInteger, fmtUtc, isFreePublicStage, stageStatus, parseWei, parseIsoSeconds } from "./util.js";
+import { alertKey, isSoldOut, fmtInteger, fmtUtc, isFreePublicStage, stageStatus, parseWei, parseIsoSeconds } from "./util.js";
 
 function chainLabel(chain) {
   const names = {
@@ -92,7 +92,7 @@ export async function notifyCandidate({
     await state.saveStageWatch({ ...watch, paid_warning_sent: 1 });
     return true;
   }
-  if (alerted || !isFreePublicStage(stage, nowSec, !config.practiceMode && allowFreeAllowlists)) return false;
+  if (isSoldOut(drop) || alerted || !isFreePublicStage(stage, nowSec, !config.practiceMode && allowFreeAllowlists)) return false;
   if (config.practiceMode) {
     if (config.chains && !config.chains.includes(String(drop.chain).toLowerCase())) return false;
     if (stageStatus(stage, nowSec) === "UPCOMING"

@@ -79,6 +79,14 @@ export function createState(db) {
         .bind(String(nowSec), key, nowSec).run();
     },
 
+    async closeCollectionWatches(drop, nowSec) {
+      // Use the existing watch expiry mechanism without deleting history.
+      await db.prepare(`UPDATE stage_watch SET last_end_time = ?
+        WHERE chain = ? AND slug = ? AND last_seen_at <= ?
+        AND (last_end_time IS NULL OR CAST(last_end_time AS INTEGER) > ?)`)
+        .bind(String(nowSec), String(drop.chain).toLowerCase(), drop.collection_slug, nowSec, nowSec).run();
+    },
+
     async getAlertedWatches() {
       const result = await db.prepare(`SELECT w.* FROM stage_watch w JOIN alerts a ON a.alert_key = w.stage_key`).all();
       return result.results || [];

@@ -1,3 +1,17 @@
+// Reject unsafe numeric inputs rather than comparing already-rounded values.
+function parseSupply(value) {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) return null;
+  return BigInt(value.trim());
+}
+
+export function isSoldOut(drop) {
+  const total = parseSupply(drop?.total_supply);
+  const max = parseSupply(drop?.max_supply);
+  return total != null && max != null && max > 0n && total >= max;
+}
+
 export function parseIsoSeconds(value) {
   if (!value || typeof value !== "string") return null;
   const ms = Date.parse(value);

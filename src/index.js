@@ -3,7 +3,7 @@ import { getConfig } from "./current.js";
 import { notifyCandidate, sendTelegram } from "./signal.js";
 import { createState } from "./state.js";
 import { OpenSeaNotFound, Tide } from "./tide.js";
-import { alertKey, dropKey, isFreePublicStage, mapLimit, parseWei } from "./util.js";
+import { alertKey, dropKey, isSoldOut, isFreePublicStage, mapLimit, parseWei } from "./util.js";
 
 const DROP_TYPES = ["featured", "upcoming", "recently_minted"];
 
@@ -36,7 +36,7 @@ function cacheRow(drop, nowSec, lastDetailAt) {
 }
 
 function eligible(drop, stage, config, nowSec) {
-  if (!config.chains.includes(String(drop.chain).toLowerCase())
+  if (isSoldOut(drop) || !config.chains.includes(String(drop.chain).toLowerCase())
     || !isFreePublicStage(stage, nowSec, !config.practiceMode && config.alertFreeAllowlists)) return false;
   if (config.practiceMode) return true;
   return !(stage.max_per_wallet != null && stage.max_per_wallet !== "" && Number(stage.max_per_wallet) > config.maxAlertPerWallet)
@@ -62,6 +62,9 @@ async function processStages(entries, deps, notify = true) {
   };
   let alerts = 0, warnings = 0;
   for (const [key, { drop, stage }] of unique) {
+    // Keep closed sold-out watches closed on rediscovery; paid warnings still run.
+    if (isSoldOut(drop) && !(parseWei(stage.price) != null && parseWei(stage.price) !== 0n
+      && await buffered.hasAlert(key) && !watches.get(key)?.paid_warning_sent)) continue;
     if (!watches.get(key) && !eligible(drop, stage, config, nowSec)) continue;
     if (!notify && !(parseWei(stage.price) != null && parseWei(stage.price) !== 0n)) {
       await observeStage({ drop, stage, ...deps, state: buffered });
@@ -76,6 +79,9 @@ async function processStages(entries, deps, notify = true) {
   }
   if (state.saveStageWatches) await state.saveStageWatches([...pending.values()]);
   else for (const row of pending.values()) await state.saveStageWatch(row);
+  for (const { drop, authoritative } of entries) {
+    if (authoritative && isSoldOut(drop)) await state.closeCollectionWatches(drop, nowSec);
+  }
   return { alerts, warnings, watched: pending.size, watchKeys: new Set([...watches.keys()].filter(key => watches.get(key)).concat([...pending.keys()])) };
 }
 
@@ -139,7 +145,7 @@ async function calendarScan({ api, state, config, env, nowSec, scanId, telegram 
   await mapLimit(due, 4, async ({ drop }) => {
     try {
       const detail = await api.getDrop(drop.collection_slug);
-      observations.set(dropKey(detail), { drop: detail, stages: detail.stages || [] });
+      observations.set(dropKey(detail), { drop: detail, stages: detail.stages || [], authoritative: true });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(detail.collection_slug);
     } catch (err) {
@@ -207,7 +213,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
     try {
       const detail = await api.getDrop(slug);
       if (!config.chains.includes(detail.chain)) return;
-      observations.push({ drop: detail, stages: detail.stages || [] });
+      observations.push({ drop: detail, stages: detail.stages || [], authoritative: true });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(slug);
     } catch (err) {
@@ -263,7 +269,7 @@ export async function runWatchScan(env, deps = {}) {
       for (const row of rows) {
         if (!present.has(row.stage_uuid)) await state.closeStageWatch(row.stage_key, nowSec);
       }
-      const result = await processStages([{ drop: detail, stages: (detail.stages || []).filter(stage => ids.has(stage.uuid)) }],
+      const result = await processStages([{ drop: detail, stages: (detail.stages || []).filter(stage => ids.has(stage.uuid)), authoritative: true }],
         { state, env, nowSec, scanId, config, telegram: deps.telegram });
       alerts += result.alerts; warnings += result.warnings;
     } catch (err) {

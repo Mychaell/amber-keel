@@ -127,3 +127,49 @@ test('live paid-to-free recovery also requires a fresh ten minute period', async
   assert.equal(await f.observe(719), false);
   assert.equal(await f.observe(720), true);
 });
+
+const supplyCases = [
+  ['equal', '1111', '1111', true],
+  ['above', '1112', '1111', true],
+  ['below', '1110', '1111', false],
+  ['unknown total', null, '1111', false],
+  ['unknown max', '1111', null, false],
+  ['zero max', '1111', 0, false],
+  ['invalid max', '1111', 'invalid', false],
+  ['invalid total', 'invalid', '1111', false],
+  ['empty total', '', '1111', false],
+  ['whitespace max', '1111', ' ', false],
+  ['negative max', '1111', '-1', false],
+  ['fractional max', '1111', '1.5', false],
+  ['boolean total', true, '1', false],
+  ['unsafe numeric total', Number.MAX_SAFE_INTEGER + 1, '9007199254740992', false],
+  ['large equal', '900719925474099312345', '900719925474099312345', true],
+  ['large below', '900719925474099312344', '900719925474099312345', false],
+  ['bigint above', 900719925474099312346n, 900719925474099312345n, true],
+];
+for (const practiceMode of [true, false]) {
+  for (const [name, total_supply, max_supply, soldOut] of supplyCases) {
+    test(`sold-out guard ${name}, practice=${practiceMode}`, async () => {
+      const f = fixture();
+      const candidate = { ...stage, start_time: iso(now - 7200) };
+      const args = { drop: { ...drop, total_supply, max_supply }, stage: candidate,
+        state: f.state, env: {}, config: { ...config, practiceMode }, minAlertSupply: -1,
+        telegram: async (_, msg) => f.messages.push(msg) };
+      await notifyCandidate({ ...args, nowSec: now, scanId: 'first' });
+      await notifyCandidate({ ...args, nowSec: now + 60, scanId: 'second' });
+      assert.equal(f.messages.length, soldOut ? 0 : 1);
+    });
+  }
+  test(`sold-out guard preserves FREE to PAID warning, practice=${practiceMode}`, async () => {
+    const f = fixture();
+    const args = { drop, stage: { ...stage, start_time: iso(now - 7200) }, state: f.state,
+      env: {}, config: { ...config, practiceMode }, telegram: async (_, msg) => f.messages.push(msg) };
+    await notifyCandidate({ ...args, nowSec: now });
+    await notifyCandidate({ ...args, nowSec: now + 60 });
+    const paid = { ...args, drop: { ...drop, total_supply: 150 }, stage: { ...args.stage, price: '1' } };
+    assert.equal(await notifyCandidate({ ...paid, nowSec: now + 120 }), true);
+    assert.equal(await notifyCandidate({ ...paid, nowSec: now + 180 }), false);
+    assert.equal(f.messages.length, 2);
+    assert.match(f.messages[1], /FREE → PAID/);
+  });
+}
