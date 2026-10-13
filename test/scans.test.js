@@ -179,3 +179,111 @@ test('authenticated manual run rejects unknown modes; other controls retain auth
     assert.equal((await worker.fetch(new Request(`https://example.test${path}`, { method: 'POST' }), control)).status, 401);
   }
 });
+
+const practice = { PRACTICE_MODE: 'true' };
+test('Arbitrum is configured by default and in wrangler; practice is a boolean', () => {
+  const vars = JSON.parse(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8')).vars;
+  const secrets = { ...env, TARGET_CHAINS: undefined };
+  assert.ok(getConfig(secrets).chains.includes('arbitrum'));
+  assert.ok(getConfig({ ...secrets, ...vars }).chains.includes('arbitrum'));
+  assert.equal(getConfig({ ...secrets, ...vars }).practiceMode, true);
+  assert.equal(getConfig({ ...secrets, PRACTICE_MODE: 'false' }).practiceMode, false);
+  assert.equal(getConfig(secrets).practiceMode, false);
+  assert.equal(vars.ALERT_FREE_ALLOWLISTS, 'false');
+  assert.equal(getConfig(secrets).upcomingAlertWindowSeconds, 600);
+});
+for (const [name, changes] of Object.entries({
+  'upcoming at T-10': { start_time: iso(now + 600) },
+  'new live': { start_time: iso(now - 60) },
+  'wallet above 10': { start_time: iso(now + 600), max_per_wallet: '11' },
+  'supply below 150': { start_time: iso(now + 600) },
+})) {
+  test(`practice alerts ${name} on first observation and suppresses duplicates`, async () => {
+    const f = fixture(); const candidate = { ...stage, ...changes };
+    f.set({ ...drop, max_supply: name === 'supply below 150' ? 149 : 150, next_stage: candidate, stages: [candidate] });
+    assert.equal((await f.discovery(0, practice)).alerts, 1);
+    assert.equal((await f.state.getStageWatch('base:test:a')).consecutive_free_observations, 1);
+    assert.equal((await f.watch(60, practice)).alerts, 0);
+    assert.equal((await f.discovery(300, practice)).alerts, 0);
+  });
+}
+for (const [name, changes] of Object.entries({
+  paid: { price: '1' },
+  'unknown price': { price: null },
+  allowlist: { stage_type: 'allowlist' },
+  presale: { stage_type: 'presale' },
+  expired: { start_time: iso(now - 120), end_time: iso(now) },
+  'invalid start': { start_time: 'invalid' },
+})) {
+  test(`practice rejects ${name}`, async () => {
+    const f = fixture(); const candidate = { ...stage, start_time: iso(now + 600), ...changes };
+    f.set({ ...drop, next_stage: candidate, stages: [candidate] });
+    assert.equal((await f.discovery(0, { ...practice, ALERT_FREE_ALLOWLISTS: 'true' })).alerts, 0);
+    assert.equal(await f.state.getStageWatch('base:test:a'), null);
+  });
+}
+test('practice rejects chains outside configured targets', async () => {
+  const f = fixture(); f.set({ ...drop, chain: 'ethereum' });
+  assert.equal((await f.discovery(0, practice)).alerts, 0);
+  assert.equal(await f.state.getStageWatch('ethereum:test:a'), null);
+});
+test('practice upcoming alert and fast watch windows remain bounded', async () => {
+  const f = fixture(); const candidate = { ...stage, start_time: iso(now + 86400), end_time: iso(now + 90000), max_per_wallet: '50' };
+  f.set({ ...drop, next_stage: candidate, stages: [candidate] });
+  assert.equal((await f.discovery(0, practice)).alerts, 0);
+  f.calls.details = [];
+  assert.equal((await f.watch(60, practice)).candidates, 0);
+  assert.deepEqual(f.calls.details, []);
+  assert.equal((await f.state.getWatchCandidates(now + 86400 - 1801, getConfig({ ...env, ...practice }))).length, 0);
+  assert.equal((await f.state.getWatchCandidates(now + 86400 - 1800, getConfig({ ...env, ...practice }))).length, 1);
+  assert.equal((await f.watch(86400 - 601, practice)).alerts, 0);
+  assert.equal((await f.watch(86400 - 600, { ...practice, WATCH_REFRESH_SECONDS: '1' })).alerts, 1);
+});
+test('practice warning remains one-time and retains history across free/paid switches', async () => {
+  const f = fixture(); const live = { ...stage, start_time: iso(now - 60), max_per_wallet: '50' };
+  f.set({ ...drop, max_supply: 100, next_stage: live, stages: [live] });
+  assert.equal((await f.discovery(0, practice)).alerts, 1);
+  const before = await f.state.getStageWatch('base:test:a');
+  const paid = { ...live, price: '1' }; f.set({ ...drop, next_stage: paid, stages: [paid] });
+  const messages = [];
+  assert.equal((await f.watch(60, practice, async (_, msg) => messages.push(msg))).warnings, 1);
+  await f.watch(120, practice, async (_, msg) => messages.push(msg));
+  f.set({ ...drop, next_stage: live, stages: [live] }); await f.watch(180, practice);
+  f.set({ ...drop, next_stage: paid, stages: [paid] }); await f.watch(240, practice, async (_, msg) => messages.push(msg));
+  assert.equal(messages.length, 1); assert.match(messages[0], /MINT CHANGED/);
+  const after = await f.state.getStageWatch('base:test:a');
+  assert.equal(after.first_seen_at, before.first_seen_at);
+  assert.equal(after.paid_warning_sent, 1);
+  assert.equal(await f.state.hasAlert('base:test:a'), true);
+});
+test('practice watch retains detail cap and never scans catalogs or chains', async () => {
+  const f = fixture(); await f.discovery(0, practice);
+  const original = await f.state.getStageWatch('base:test:a');
+  for (let i = 0; i < 5; i++) await f.state.saveStageWatch({ ...original, stage_key: `base:extra-${i}:a`, slug: `extra-${i}`, last_max_per_wallet: '50' });
+  f.calls.details = []; f.calls.feeds = f.calls.collections = f.calls.chains = 0;
+  const result = await f.watch(60, { ...practice, MAX_WATCH_DETAILS_PER_SCAN: '2' });
+  assert.equal(result.candidates, 6); assert.equal(result.details, 2);
+  assert.equal(f.calls.details.length, 2);
+  assert.equal(f.calls.feeds, 0); assert.equal(f.calls.collections, 0); assert.equal(f.calls.chains, 0);
+  assert.equal((await f.state.getWatchCandidates(now + 120, getConfig({ ...env, ...practice }))).length, 6);
+});
+
+test('explicit practice=false restores normal stability for upcoming and live stages', async () => {
+  const f = fixture(); await f.discovery(0, { PRACTICE_MODE: 'false' });
+  assert.equal((await f.watch(60, { PRACTICE_MODE: 'false' })).alerts, 0);
+  assert.equal((await f.watch(120, { PRACTICE_MODE: 'false' })).alerts, 0);
+  assert.equal((await f.watch(600, { PRACTICE_MODE: 'false' })).alerts, 1);
+  const g = fixture(); const live = { ...stage, start_time: iso(now - 60) };
+  g.set({ ...drop, next_stage: live, stages: [live] });
+  assert.equal((await g.discovery(0, { PRACTICE_MODE: 'false' })).alerts, 0);
+  assert.equal((await g.watch(60, { PRACTICE_MODE: 'false' })).alerts, 1);
+});
+for (const [name, changes] of Object.entries({ wallet: { max_per_wallet: '11' }, supply: {} })) {
+  test(`explicit practice=false restores ${name} quality filter`, async () => {
+    const f = fixture(); const live = { ...stage, start_time: iso(now - 60), ...changes };
+    f.set({ ...drop, max_supply: name === 'supply' ? 149 : 150, next_stage: live, stages: [live] });
+    assert.equal((await f.discovery(0, { PRACTICE_MODE: 'false' })).alerts, 0);
+    assert.equal(await f.state.getStageWatch('base:test:a'), null);
+    assert.equal((await f.discovery(300, practice)).alerts, 1);
+  });
+}

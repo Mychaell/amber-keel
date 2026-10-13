@@ -10,7 +10,8 @@
     "crons": ["* * * * *", "*/5 * * * *"]
   },
   "vars": {
-    "TARGET_CHAINS": "robinhood,base,optimism,ethereum,ink,arc,hyperevm",
+    "TARGET_CHAINS": "robinhood,base,optimism,ethereum,ink,arc,hyperevm,arbitrum",
+    "PRACTICE_MODE": "true",
     "DETAIL_REFRESH_SECONDS": "300",
     "STABILITY_MIN_SECONDS": "600",
     "STABILITY_MIN_OBSERVATIONS": "3",

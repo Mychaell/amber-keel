@@ -40,7 +40,7 @@ export function createState(db) {
     },
 
     async getWatchCandidates(nowSec, config) {
-      const types = config.alertFreeAllowlists
+      const types = !config.practiceMode && config.alertFreeAllowlists
         ? "'public_sale','presale','allowlist','whitelist','signed_presale'" : "'public_sale'";
       const result = await db.prepare(`WITH relevant AS (
           SELECT alert_key AS stage_key FROM alerts
@@ -55,12 +55,12 @@ export function createState(db) {
         LEFT JOIN alerts a ON a.alert_key = w.stage_key
         WHERE (w.last_end_time IS NULL OR CAST(w.last_end_time AS INTEGER) > ?)
         AND w.chain IN (${config.chains.map(() => "?").join(",")})
-        AND (a.alert_key IS NOT NULL OR w.last_max_per_wallet IS NULL OR CAST(w.last_max_per_wallet AS INTEGER) <= ?)
+        AND (? = 1 OR a.alert_key IS NOT NULL OR w.last_max_per_wallet IS NULL OR CAST(w.last_max_per_wallet AS INTEGER) <= ?)
         AND w.last_seen_at <= ?
         ORDER BY (a.alert_key IS NOT NULL) DESC,
           (CAST(w.last_start_time AS INTEGER) <= ?) DESC, CAST(w.last_start_time AS INTEGER), w.last_seen_at`)
         .bind(nowSec, nowSec + config.watchWindowSeconds, nowSec, ...config.chains,
-          config.maxAlertPerWallet, nowSec - config.watchRefreshSeconds, nowSec).all();
+          config.practiceMode ? 1 : 0, config.maxAlertPerWallet, nowSec - config.watchRefreshSeconds, nowSec).all();
       return (result.results || []).map(row => ({ ...row, alerted: Boolean(row.alerted) }));
     },
 

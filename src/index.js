@@ -36,9 +36,10 @@ function cacheRow(drop, nowSec, lastDetailAt) {
 }
 
 function eligible(drop, stage, config, nowSec) {
-  return config.chains.includes(String(drop.chain).toLowerCase())
-    && isFreePublicStage(stage, nowSec, config.alertFreeAllowlists)
-    && !(stage.max_per_wallet != null && stage.max_per_wallet !== "" && Number(stage.max_per_wallet) > config.maxAlertPerWallet)
+  if (!config.chains.includes(String(drop.chain).toLowerCase())
+    || !isFreePublicStage(stage, nowSec, !config.practiceMode && config.alertFreeAllowlists)) return false;
+  if (config.practiceMode) return true;
+  return !(stage.max_per_wallet != null && stage.max_per_wallet !== "" && Number(stage.max_per_wallet) > config.maxAlertPerWallet)
     && !(drop.max_supply != null && drop.max_supply !== "" && Number(drop.max_supply) < config.minAlertSupply);
 }
 

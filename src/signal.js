@@ -1,5 +1,5 @@
 import { observeStage, isStable } from "./watch.js";
-import { alertKey, fmtInteger, fmtUtc, isFreePublicStage, stageStatus, parseWei } from "./util.js";
+import { alertKey, fmtInteger, fmtUtc, isFreePublicStage, stageStatus, parseWei, parseIsoSeconds } from "./util.js";
 
 function chainLabel(chain) {
   const names = {
@@ -10,6 +10,7 @@ function chainLabel(chain) {
     ink: "Ink",
     arc: "Arc",
     hyperevm: "HyperEVM",
+    arbitrum: "Arbitrum",
   };
   return names[String(chain || "").toLowerCase()] || String(chain || "Unknown");
 }
@@ -91,16 +92,21 @@ export async function notifyCandidate({
     await state.saveStageWatch({ ...watch, paid_warning_sent: 1 });
     return true;
   }
-  if (alerted || !isFreePublicStage(stage, nowSec, allowFreeAllowlists) || !isStable(watch, stage, nowSec, config)) return false;
+  if (alerted || !isFreePublicStage(stage, nowSec, !config.practiceMode && allowFreeAllowlists)) return false;
+  if (config.practiceMode) {
+    if (config.chains && !config.chains.includes(String(drop.chain).toLowerCase())) return false;
+    if (stageStatus(stage, nowSec) === "UPCOMING"
+      && parseIsoSeconds(stage.start_time) - nowSec > config.upcomingAlertWindowSeconds) return false;
+  } else if (!isStable(watch, stage, nowSec, config)) return false;
 
   const rawLimit = stage?.max_per_wallet;
-  if (rawLimit != null && rawLimit !== "") {
+  if (!config.practiceMode && rawLimit != null && rawLimit !== "") {
     const perWallet = Number(rawLimit);
     if (Number.isFinite(perWallet) && perWallet > maxAlertPerWallet) return false;
   }
 
   const rawSupply = drop?.max_supply;
-  if (rawSupply != null && rawSupply !== "") {
+  if (!config.practiceMode && rawSupply != null && rawSupply !== "") {
     const maxSupply = Number(rawSupply);
     if (Number.isFinite(maxSupply) && maxSupply < minAlertSupply) return false;
   }

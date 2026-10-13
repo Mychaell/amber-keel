@@ -229,3 +229,7 @@ test("message uses exact OpenSea URL", () => {
   const msg = buildMessage(drop, stage(), NOW);
   assert.match(msg, /https:\/\/opensea\.io\/collection\/hood-apes\/overview/);
 });
+
+test('Arbitrum message displays its chain label', () => {
+  assert.match(buildMessage({ ...drop, chain: 'arbitrum' }, stage(), NOW), /^Chain: Arbitrum$/m);
+});
