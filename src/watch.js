@@ -8,7 +8,7 @@ const fields = {
   last_stage_type: stage => stage.stage_type ?? null,
 };
 
-export async function observeStage({ drop, stage, state, nowSec, scanId = String(nowSec) }) {
+export async function observeStage({ drop, stage, state, nowSec, scanId = String(Math.floor(nowSec / 60)) }) {
   const key = alertKey(drop, stage);
   const previous = await state.getStageWatch(key);
   const values = Object.fromEntries(Object.entries(fields).map(([name, read]) => [name, read(stage)]));

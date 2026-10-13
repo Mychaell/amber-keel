@@ -121,6 +121,5 @@ export async function notifyCandidate({
     sentAt: nowSec,
     openseaUrl: drop.opensea_url || null,
   });
-  console.log(`alerted ${key}`);
   return true;
 }

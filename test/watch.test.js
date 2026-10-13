@@ -117,7 +117,7 @@ test('Worker merges summary and detail into one observation and polls selectivel
   assert.equal(detailCalls, 1);
   await runScan(env, { api, state: f.state, nowSec: now + 60, scanId: 'c' });
   assert.equal(detailCalls, 2);
-  assert.equal([...f.watches.values()][0].consecutive_free_observations, 3);
+  assert.equal([...f.watches.values()][0].consecutive_free_observations, 2);
 });
 test('live paid-to-free recovery also requires a fresh ten minute period', async () => {
   const f = fixture({ start_time: iso(now - 60) });

@@ -7,7 +7,7 @@
     "enabled": true
   },
   "triggers": {
-    "crons": ["* * * * *"]
+    "crons": ["* * * * *", "*/5 * * * *"]
   },
   "vars": {
     "TARGET_CHAINS": "robinhood,base,optimism,ethereum,ink,arc,hyperevm",
@@ -19,7 +19,9 @@
     "WATCH_REFRESH_SECONDS": "60",
     "WATCH_WINDOW_SECONDS": "1800",
     "MAX_DETAILS_PER_SCAN": "8",
-    "COLLECTION_SWEEP_SECONDS": "300",
+    "MAX_WATCH_DETAILS_PER_SCAN": "12",
+    "MAX_DROP_PAGES_PER_FEED": "5",
+    "COLLECTION_SWEEP_SECONDS": "900",
     "COLLECTION_LIMIT": "12",
     "MAX_FALLBACK_DETAILS": "12",
     "MISS_TTL_SECONDS": "21600",

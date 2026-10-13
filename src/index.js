@@ -3,7 +3,7 @@ import { getConfig } from "./current.js";
 import { notifyCandidate, sendTelegram } from "./signal.js";
 import { createState } from "./state.js";
 import { OpenSeaNotFound, Tide } from "./tide.js";
-import { dropKey, mapLimit, parseWei } from "./util.js";
+import { alertKey, dropKey, isFreePublicStage, mapLimit, parseWei } from "./util.js";
 
 const DROP_TYPES = ["featured", "upcoming", "recently_minted"];
 
@@ -35,14 +35,47 @@ function cacheRow(drop, nowSec, lastDetailAt) {
   };
 }
 
-async function notifyStages(drop, stages, deps) {
-  let sent = 0;
+function eligible(drop, stage, config, nowSec) {
+  return config.chains.includes(String(drop.chain).toLowerCase())
+    && isFreePublicStage(stage, nowSec, config.alertFreeAllowlists)
+    && !(stage.max_per_wallet != null && stage.max_per_wallet !== "" && Number(stage.max_per_wallet) > config.maxAlertPerWallet)
+    && !(drop.max_supply != null && drop.max_supply !== "" && Number(drop.max_supply) < config.minAlertSupply);
+}
+
+// One bulk read and batched writes per group, including existing watches that no longer qualify.
+async function processStages(entries, deps, notify = true) {
+  const { state, config, nowSec } = deps;
   const unique = new Map();
-  for (const stage of stages || []) if (stage?.uuid) unique.set(stage.uuid, stage);
-  for (const stage of unique.values()) {
-    if (await notifyCandidate({ drop, stage, ...deps })) sent += 1;
+  for (const { drop, stages } of entries) for (const stage of stages || []) {
+    if (stage?.uuid) unique.set(alertKey(drop, stage), { drop, stage });
   }
-  return sent;
+  const keys = [...unique.keys()];
+  const watches = state.getStageWatches ? await state.getStageWatches(keys)
+    : new Map(await Promise.all(keys.map(async key => [key, await state.getStageWatch(key)])));
+  const pending = new Map();
+  const buffered = {
+    ...state,
+    getStageWatch: async key => pending.get(key) || watches.get(key) || null,
+    saveStageWatch: async row => { pending.set(row.stage_key, row); },
+    hasAlert: async key => state.getStageWatches ? Boolean(watches.get(key)?.alerted) : state.hasAlert(key),
+  };
+  let alerts = 0, warnings = 0;
+  for (const [key, { drop, stage }] of unique) {
+    if (!watches.get(key) && !eligible(drop, stage, config, nowSec)) continue;
+    if (!notify && !(parseWei(stage.price) != null && parseWei(stage.price) !== 0n)) {
+      await observeStage({ drop, stage, ...deps, state: buffered });
+      continue;
+    }
+    const warning = await buffered.hasAlert(key) && parseWei(stage.price) != null && parseWei(stage.price) !== 0n;
+    if (await notifyCandidate({ drop, stage, ...deps, state: buffered,
+      allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet,
+      minAlertSupply: config.minAlertSupply })) {
+      if (warning) warnings++; else alerts++;
+    }
+  }
+  if (state.saveStageWatches) await state.saveStageWatches([...pending.values()]);
+  else for (const row of pending.values()) await state.saveStageWatch(row);
+  return { alerts, warnings, watched: pending.size, watchKeys: new Set([...watches.keys()].filter(key => watches.get(key)).concat([...pending.keys()])) };
 }
 
 async function maybeValidateChains({ api, state, config, nowSec }) {
@@ -61,12 +94,12 @@ async function maybeValidateChains({ api, state, config, nowSec }) {
   }
 }
 
-async function calendarScan({ api, state, config, env, nowSec, scanId }) {
+async function calendarScan({ api, state, config, env, nowSec, scanId, telegram }) {
   let feedSuccesses = 0;
   const feedErrors = [];
   const pages = await Promise.all(DROP_TYPES.map(async (type) => {
     try {
-      const rows = await api.listDrops(type, config.chains);
+      const rows = await api.listDrops(type, config.chains, config.maxDropPagesPerFeed);
       feedSuccesses += 1;
       return rows;
     } catch (err) {
@@ -81,43 +114,22 @@ async function calendarScan({ api, state, config, env, nowSec, scanId }) {
   const summaries = new Map();
   for (const rows of pages) for (const row of rows) mergeSummary(summaries, row);
   const drops = [...summaries.values()];
-  console.log(`calendar ${drops.length} unique drops`);
 
   let sent = 0;
-  // Record summaries before details, but defer Telegram decisions until details finish.
-  // Conflicting sources reset stability without adding a second scan observation.
-  for (const drop of drops) {
-    const stages = new Map([drop.active_stage, drop.next_stage].filter(stage => stage?.uuid).map(stage => [stage.uuid, stage]));
-    for (const stage of stages.values()) {
-      const price = parseWei(stage.price);
-      if (price != null && price !== 0n) {
-        sent += await notifyStages(drop, [stage], { state, env, nowSec, scanId, config });
-      } else {
-        await observeStage({ drop, stage, state, nowSec, scanId });
-      }
-    }
-  }
-  const alertedWatches = await state.getAlertedWatches();
-  for (const watch of alertedWatches) {
-    if (watch.last_end_time != null && Number(watch.last_end_time) <= nowSec) continue;
-    const key = `${watch.chain}:${watch.slug}`;
-    if (!summaries.has(key)) {
-      const drop = { chain: watch.chain, collection_slug: watch.slug };
-      summaries.set(key, drop);
-      drops.push(drop);
-    }
-  }
+  const initial = await processStages(drops.map(drop => ({ drop, stages: [drop.active_stage, drop.next_stage] })),
+    { state, env, nowSec, scanId, config, telegram }, false);
   const observations = new Map(drops.map(drop => [dropKey(drop), { drop, stages: [drop.active_stage, drop.next_stage] }]));
 
-  const keys = drops.map(dropKey);
+  const relevantDrops = drops.filter(drop => [drop.active_stage, drop.next_stage].some(stage => stage?.uuid && initial.watchKeys.has(alertKey(drop, stage))));
+  const keys = relevantDrops.map(dropKey);
   const caches = await state.getCaches(keys);
-  const due = drops
+  const due = relevantDrops
     .map((drop) => ({ drop, cached: caches.get(dropKey(drop)) || null }))
     .filter(({ drop, cached }) => {
       if (!cached) return true;
       const changed = (cached.active_uuid || null) !== (drop.active_stage?.uuid || null)
         || (cached.next_uuid || null) !== (drop.next_stage?.uuid || null);
-      const stale = nowSec - Number(cached.last_detail_at || 0) >= detailRefreshSeconds(drop, alertedWatches, nowSec, config);
+      const stale = nowSec - Number(cached.last_detail_at || 0) >= detailRefreshSeconds(drop, [], nowSec, config);
       return changed || stale;
     })
     .sort((a, b) => Number(a.cached?.last_detail_at || 0) - Number(b.cached?.last_detail_at || 0))
@@ -139,7 +151,7 @@ async function calendarScan({ api, state, config, env, nowSec, scanId }) {
   });
 
   const detailedKeys = new Set(due.map(({ drop }) => dropKey(drop)));
-  await mapLimit(drops.filter((drop) => !detailedKeys.has(dropKey(drop))), 4, async (drop) => {
+  await mapLimit(relevantDrops.filter((drop) => !detailedKeys.has(dropKey(drop))), 4, async (drop) => {
     const cached = caches.get(dropKey(drop));
     const changed = !cached
       || (cached.active_uuid || null) !== (drop.active_stage?.uuid || null)
@@ -149,19 +161,17 @@ async function calendarScan({ api, state, config, env, nowSec, scanId }) {
     }
   });
 
-  for (const { drop, stages } of observations.values()) {
-    sent += await notifyStages(drop, stages, {
-      state, env, nowSec, scanId, config, allowFreeAllowlists: config.alertFreeAllowlists,
-      maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
-    });
-  }
-  return { sent, summaries };
+  const results = await processStages([...observations.values()], { state, env, nowSec, scanId, config, telegram });
+  sent += results.alerts;
+  return { sent, warnings: initial.warnings + results.warnings, watched: initial.watched, details: due.length,
+    pages: pages.reduce((sum, rows) => sum + (rows.pages || 0), 0),
+    truncated: pages.some(rows => rows.truncated), summaries };
 }
 
-async function collectionSweep({ api, state, config, env, nowSec, summaries, scanId }) {
+async function collectionSweep({ api, state, config, env, nowSec, summaries, scanId, telegram }) {
   const raw = await state.getSetting("collection_sweep_at");
   const last = Number(raw || 0);
-  if (nowSec - last < config.collectionSweepSeconds || config.maxFallbackDetails === 0) return 0;
+  if (nowSec - last < config.collectionSweepSeconds || config.maxFallbackDetails === 0) return { alerts: 0, warnings: 0, details: 0, watched: 0 };
 
   const pages = await Promise.all(config.chains.map(async (chain) => {
     try {
@@ -191,14 +201,12 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
     .filter((slug) => nowSec - Number(misses.get(slug) || 0) >= config.missTtlSeconds)
     .slice(0, config.maxFallbackDetails);
 
-  let sent = 0;
+  const observations = [];
   await mapLimit(filtered, 4, async (slug) => {
     try {
       const detail = await api.getDrop(slug);
       if (!config.chains.includes(detail.chain)) return;
-      sent += await notifyStages(detail, detail.stages || [], {
-        state, env, nowSec, scanId, config, allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet, minAlertSupply: config.minAlertSupply,
-      });
+      observations.push({ drop: detail, stages: detail.stages || [] });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(slug);
     } catch (err) {
@@ -208,22 +216,67 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
   });
 
   await state.setSetting("collection_sweep_at", nowSec, nowSec);
-  console.log(`collection sweep ${filtered.length} detail checks`);
-  return sent;
+
+  const result = await processStages(observations, { state, env, nowSec, scanId, config, telegram });
+  return { ...result, details: filtered.length };
 }
 
-export async function runScan(env, deps = {}) {
+export async function runDiscoveryScan(env, deps = {}) {
   const config = getConfig(env);
   const nowSec = deps.nowSec ?? Math.floor(Date.now() / 1000);
-  const scanId = deps.scanId ?? crypto.randomUUID();
+  const scanId = String(Math.floor(nowSec / 60));
   const state = deps.state || createState(env.DB);
   const api = deps.api || new Tide({ apiKey: env.OPENSEA_API_KEY });
 
   await maybeValidateChains({ api, state, config, nowSec });
-  const first = await calendarScan({ api, state, config, env, nowSec, scanId });
-  const extra = await collectionSweep({ api, state, config, env, nowSec, summaries: first.summaries, scanId });
-  console.log(`done alerts=${first.sent + extra}`);
-  return { alerts: first.sent + extra, drops: first.summaries.size };
+  const first = await calendarScan({ api, state, config, env, nowSec, scanId, telegram: deps.telegram });
+  const extra = await collectionSweep({ api, state, config, env, nowSec, summaries: first.summaries, scanId, telegram: deps.telegram });
+  console.log(`discovery: drops=${first.summaries.size} watched=${first.watched + extra.watched} details=${first.details + extra.details} alerts=${first.sent + extra.alerts} warnings=${first.warnings + extra.warnings} pages=${first.pages} truncated=${first.truncated}`);
+  return { alerts: first.sent + extra.alerts, warnings: first.warnings + extra.warnings, drops: first.summaries.size, pages: first.pages, truncated: first.truncated };
+}
+
+// Backwards-compatible programmatic discovery entry point.
+export const runScan = runDiscoveryScan;
+
+export async function runWatchScan(env, deps = {}) {
+  const config = getConfig(env);
+  const nowSec = deps.nowSec ?? Math.floor(Date.now() / 1000);
+  const scanId = String(Math.floor(nowSec / 60));
+  const state = deps.state || createState(env.DB);
+  const api = deps.api || new Tide({ apiKey: env.OPENSEA_API_KEY });
+  const candidates = await state.getWatchCandidates(nowSec, config);
+  const groups = new Map();
+  for (const row of candidates) {
+    const key = `${row.chain}:${row.slug}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  let alerts = 0, warnings = 0;
+  const selected = [...groups.values()].slice(0, config.maxWatchDetailsPerScan);
+  await mapLimit(selected, 4, async rows => {
+    try {
+      const detail = await api.getDrop(rows[0].slug);
+      if (String(detail.chain).toLowerCase() !== rows[0].chain) return;
+      const ids = new Set(rows.map(row => row.stage_uuid));
+      const present = new Set((detail.stages || []).map(stage => stage.uuid));
+      for (const row of rows) {
+        if (!present.has(row.stage_uuid)) await state.closeStageWatch(row.stage_key, nowSec);
+      }
+      const result = await processStages([{ drop: detail, stages: (detail.stages || []).filter(stage => ids.has(stage.uuid)) }],
+        { state, env, nowSec, scanId, config, telegram: deps.telegram });
+      alerts += result.alerts; warnings += result.warnings;
+    } catch (err) {
+      console.warn(`watch detail ${rows[0].slug}: ${err.message}`);
+    }
+  });
+  console.log(`watch: candidates=${candidates.length} details=${selected.length} alerts=${alerts} warnings=${warnings}`);
+  return { candidates: candidates.length, details: selected.length, alerts, warnings };
+}
+
+export function dispatchScheduled(controller, env, deps) {
+  if (controller.cron === "* * * * *") return runWatchScan(env, deps);
+  if (controller.cron === "*/5 * * * *") return runDiscoveryScan(env, deps);
+  throw new Error(`unknown cron: ${controller.cron}`);
 }
 
 function jsonResponse(body, status = 200) {
@@ -242,8 +295,8 @@ function isAuthorized(request, env) {
 }
 
 export default {
-  async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runScan(env).catch((err) => console.error("scan failed:", err.message)));
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(dispatchScheduled(controller, env).catch((err) => console.error("scan failed:", err.message)));
   },
 
   async fetch(request, env) {
@@ -298,7 +351,7 @@ export default {
 
         for (const type of DROP_TYPES) {
           try {
-            const rows = await api.listDrops(type, config.chains);
+            const rows = await api.listDrops(type, config.chains, config.maxDropPagesPerFeed);
             checks[type] = { ok: true, count: rows.length };
           } catch (err) {
             checks[type] = { ok: false, error: err.message };
@@ -308,7 +361,9 @@ export default {
         return jsonResponse({ ok: true, checks });
       }
 
-      const result = await runScan(env);
+      const mode = url.searchParams.get("mode") || "discovery";
+      if (!["watch", "discovery"].includes(mode)) return jsonResponse({ ok: false, error: "unknown mode" }, 400);
+      const result = await (mode === "watch" ? runWatchScan : runDiscoveryScan)(env);
       return jsonResponse({ ok: true, ...result });
     } catch (err) {
       console.error(`manual ${url.pathname} failed:`, err.message);

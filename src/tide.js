@@ -45,7 +45,7 @@ export class Tide {
     return res.json();
   }
 
-  async listDrops(type, chains) {
+  async listDrops(type, chains, maxPages = 5) {
     const rows = [];
     let cursor = null;
     let pages = 0;
@@ -59,8 +59,13 @@ export class Tide {
       rows.push(...(payload.drops || []));
       cursor = payload.next || null;
       pages += 1;
-      if (pages > 100) throw new Error(`OpenSea pagination exceeded 100 pages for ${type}`);
+      if (cursor && pages >= maxPages) {
+        console.warn(`discovery ${type}: pagination truncated at ${maxPages} pages`);
+        break;
+      }
     } while (cursor);
+    rows.pages = pages;
+    rows.truncated = Boolean(cursor);
     return rows;
   }
 
