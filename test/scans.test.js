@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { createState } from '../src/state.js';
 import { getConfig } from '../src/current.js';
 import { runDiscoveryScan, runWatchScan, dispatchScheduled } from '../src/index.js';
-import { Tide } from '../src/tide.js';
+import { OpenSeaNotFound, Tide } from '../src/tide.js';
 const now = 1800000000;
 const iso = n => new Date(n * 1000).toISOString();
 const env = { DB: {}, OPENSEA_API_KEY: 'x', TELEGRAM_BOT_TOKEN: 'x', TELEGRAM_CHAT_ID: 'x', TARGET_CHAINS: 'base', MAX_FALLBACK_DETAILS: '0' };
@@ -28,20 +28,20 @@ function fixture() {
     getDrop: async slug => { calls.details.push(slug); return { ...current, collection_slug: slug }; },
     listCollections: async () => { calls.collections++; return { collections: [] }; },
     getChains: async () => { calls.chains++; return { chains: [{ chain: 'base' }] }; } };
-  return { sql, state, api, calls, set: d => { current = d; },
+  return { sql, db, state, api, calls, set: d => { current = d; },
     discovery: async (seconds = 0, extra = {}) => runDiscoveryScan({ ...env, ...extra }, { state, api, nowSec: now + seconds, telegram: async () => {} }),
     watch: async (seconds = 60, extra = {}, telegram = async () => {}) => runWatchScan({ ...env, ...extra }, { state, api, nowSec: now + seconds, telegram }) };
 }
 test('migrations apply and watch cron calls only direct watched details', async () => {
   const f = fixture(); await f.discovery();
   f.calls.feeds = f.calls.chains = f.calls.collections = 0;
-  await dispatchScheduled({ cron: '* * * * *' }, env, { state: f.state, api: f.api, nowSec: now + 60 });
+  await dispatchScheduled({ cron: '* * * * *', scheduledTime: Date.UTC(2026, 9, 15, 12, 1) }, env, { state: f.state, api: f.api, nowSec: now + 60 });
   assert.equal(f.calls.feeds, 0); assert.equal(f.calls.collections, 0); assert.equal(f.calls.chains, 0);
   assert.equal(f.calls.details.length, 2);
 });
 test('discovery cron runs feeds and never queries watch candidates', async () => {
   const f = fixture(); f.state.getWatchCandidates = () => { throw new Error('watch query called'); };
-  await dispatchScheduled({ cron: '*/5 * * * *' }, env, { state: f.state, api: f.api, nowSec: now });
+  await dispatchScheduled({ cron: '* * * * *', scheduledTime: Date.UTC(2026, 9, 15, 12, 0) }, env, { state: f.state, api: f.api, nowSec: now });
   assert.equal(f.calls.feeds, 3);
 });
 for (const endTime of [stage.end_time, null]) {
@@ -334,3 +334,90 @@ test('sold-out authoritative discovery closes existing watches even when detail 
   assert.equal(after.first_seen_at, before.first_seen_at);
   assert.equal((await f.watch(360, practice)).candidates, 0);
 });
+
+for (const minute of [0, 5, 10, 1, 4, 6]) {
+  test(`scheduled UTC minute ${minute} runs only ${minute % 5 === 0 ? 'discovery' : 'watch'} using scheduledTime`, async t => {
+    const f = fixture();
+    await f.discovery();
+    f.calls.feeds = f.calls.chains = f.calls.collections = 0;
+    f.calls.details = [];
+    let watchQueries = 0;
+    const getCandidates = f.state.getWatchCandidates;
+    f.state.getWatchCandidates = async (...args) => { watchQueries++; return getCandidates(...args); };
+    // Delayed delivery in the opposite mode must not affect routing.
+    t.mock.method(Date, 'now', () => Date.UTC(2026, 9, 15, 12, minute % 5 === 0 ? 1 : 0));
+    await dispatchScheduled({ cron: '* * * * *', scheduledTime: Date.UTC(2026, 9, 15, 12, minute) }, env,
+      { state: f.state, api: f.api, nowSec: now + 300, telegram: async () => {} });
+    assert.equal(f.calls.feeds, minute % 5 === 0 ? 3 : 0);
+    assert.equal(watchQueries, minute % 5 === 0 ? 0 : 1);
+    if (minute % 5 !== 0) assert.deepEqual(f.calls.details, ['test']);
+  });
+}
+
+test('wrangler config uses only the one-minute cron', () => {
+  const config = JSON.parse(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
+  assert.deepEqual(config.triggers.crons, ['* * * * *']);
+});
+
+test('watch 404 expires all rows for selected chain and slug, retaining history and alerts', async () => {
+  const f = fixture(); await f.discovery();
+  const original = await f.state.getStageWatch('base:test:a');
+  // Include a stage outside the watch window: cleanup must cover more than selected rows.
+  await f.state.saveStageWatch({ ...original, stage_key: 'base:test:later', stage_uuid: 'later', last_start_time: String(now + 86400) });
+  await f.state.saveStageWatch({ ...original, stage_key: 'arbitrum:test:a', chain: 'arbitrum' });
+  await f.state.saveStageWatch({ ...original, stage_key: 'base:other:a', slug: 'other' });
+  await f.state.markAlert({ key: original.stage_key, chain: 'base', slug: 'test', stageUuid: 'a', sentAt: now });
+  const before = await f.state.getStageWatch(original.stage_key);
+  f.calls.details = [];
+  f.api.getDrop = async slug => {
+    f.calls.details.push(slug);
+    if (slug === 'test') throw new OpenSeaNotFound('404');
+    return { ...drop, collection_slug: slug };
+  };
+  await f.watch(60);
+  assert.deepEqual({ ...await f.state.getStageWatch(original.stage_key) }, { ...before, last_end_time: String(now + 60) });
+  assert.equal((await f.state.getStageWatch('base:test:later')).last_end_time, String(now + 60));
+  assert.equal((await f.state.getStageWatch('arbitrum:test:a')).last_end_time, original.last_end_time);
+  assert.equal((await f.state.getStageWatch('base:other:a')).last_end_time, original.last_end_time);
+  assert.equal(await f.state.hasAlert(original.stage_key), true);
+  assert.ok(!(await f.state.getWatchCandidates(now + 120, getConfig(env))).some(row => row.slug === 'test'));
+  f.calls.details = [];
+  await f.watch(120);
+  assert.deepEqual(f.calls.details, ['other']);
+});
+
+for (const message of ['OpenSea 500: internal server error', 'network fetch failed', 'OpenSea 429: rate limited', 'request timeout']) {
+  test(`watch ${message} retains watches for retry`, async () => {
+    const f = fixture(); await f.discovery();
+    const before = await f.state.getStageWatch('base:test:a');
+    let calls = 0;
+    f.api.getDrop = async () => { calls++; throw new Error(message); };
+    await f.watch(60);
+    assert.deepEqual(await f.state.getStageWatch('base:test:a'), before);
+    await f.watch(120);
+    assert.equal(calls, 2);
+  });
+}
+
+for (const mode of ['watch', 'discovery']) {
+  test(`authenticated manual /run?mode=${mode} still runs only ${mode}`, async t => {
+    const { default: worker } = await import('../src/index.js');
+    const f = fixture();
+    const paths = [];
+    t.mock.method(globalThis, 'fetch', async input => {
+      const url = new URL(input);
+      paths.push(url.pathname);
+      if (url.pathname.endsWith('/chains')) return Response.json({ chains: [{ chain: 'base' }] });
+      if (url.pathname.includes('/drops')) return Response.json({ drops: [] });
+      throw new Error(`unexpected API request ${url}`);
+    });
+    const response = await worker.fetch(new Request(`https://example.test/run?mode=${mode}`, {
+      method: 'POST', headers: { authorization: 'Bearer local-test' },
+    }), { ...env, DB: f.db, CONTROL_TOKEN: 'local-test' });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.ok, true);
+    if (mode === 'watch') { assert.equal(result.candidates, 0); assert.deepEqual(paths, []); }
+    else { assert.equal(result.drops, 0); assert.equal(paths.filter(path => path.includes('/drops')).length, 3); }
+  });
+}

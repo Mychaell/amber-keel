@@ -273,7 +273,12 @@ export async function runWatchScan(env, deps = {}) {
         { state, env, nowSec, scanId, config, telegram: deps.telegram });
       alerts += result.alerts; warnings += result.warnings;
     } catch (err) {
-      console.warn(`watch detail ${rows[0].slug}: ${err.message}`);
+      if (err instanceof OpenSeaNotFound) {
+        await state.closeCollectionWatches({ chain: rows[0].chain, collection_slug: rows[0].slug }, nowSec);
+        console.log(`watch drop removed: ${rows[0].slug}`);
+      } else {
+        console.warn(`watch detail ${rows[0].slug}: ${err.message}`);
+      }
     }
   });
   console.log(`watch: candidates=${candidates.length} details=${selected.length} alerts=${alerts} warnings=${warnings}`);
@@ -281,9 +286,8 @@ export async function runWatchScan(env, deps = {}) {
 }
 
 export function dispatchScheduled(controller, env, deps) {
-  if (controller.cron === "* * * * *") return runWatchScan(env, deps);
-  if (controller.cron === "*/5 * * * *") return runDiscoveryScan(env, deps);
-  throw new Error(`unknown cron: ${controller.cron}`);
+  const minute = new Date(controller.scheduledTime).getUTCMinutes();
+  return minute % 5 === 0 ? runDiscoveryScan(env, deps) : runWatchScan(env, deps);
 }
 
 function jsonResponse(body, status = 200) {
