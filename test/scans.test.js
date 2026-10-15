@@ -8,7 +8,7 @@ import { runDiscoveryScan, runWatchScan, dispatchScheduled } from '../src/index.
 import { OpenSeaNotFound, Tide } from '../src/tide.js';
 const now = 1800000000;
 const iso = n => new Date(n * 1000).toISOString();
-const env = { DB: {}, OPENSEA_API_KEY: 'x', TELEGRAM_BOT_TOKEN: 'x', TELEGRAM_CHAT_ID: 'x', TARGET_CHAINS: 'base', MAX_FALLBACK_DETAILS: '0' };
+const env = { DB: {}, OPENSEA_API_KEY: 'x', TELEGRAM_BOT_TOKEN: 'x', TELEGRAM_CHAT_ID: 'x', TARGET_CHAINS: 'base', PRACTICE_MODE: 'false', MAX_FALLBACK_DETAILS: '0' };
 const stage = { uuid: 'a', price: '0', stage_type: 'public_sale', max_per_wallet: '10', start_time: iso(now + 1200), end_time: iso(now + 7200) };
 const drop = { chain: 'base', collection_slug: 'test', max_supply: 150, next_stage: stage, stages: [stage] };
 function fixture() {
@@ -186,7 +186,7 @@ test('Arbitrum is configured by default and in wrangler; practice is a boolean',
   const secrets = { ...env, TARGET_CHAINS: undefined };
   assert.ok(getConfig(secrets).chains.includes('arbitrum'));
   assert.ok(getConfig({ ...secrets, ...vars }).chains.includes('arbitrum'));
-  assert.equal(getConfig({ ...secrets, ...vars }).practiceMode, true);
+  assert.deepEqual(getConfig({ ...secrets, ...vars }).practiceChains, ['base', 'arbitrum']);
   assert.equal(getConfig({ ...secrets, PRACTICE_MODE: 'false' }).practiceMode, false);
   assert.equal(getConfig(secrets).practiceMode, false);
   assert.equal(vars.ALERT_FREE_ALLOWLISTS, 'false');
@@ -419,5 +419,124 @@ for (const mode of ['watch', 'discovery']) {
     assert.equal(result.ok, true);
     if (mode === 'watch') { assert.equal(result.candidates, 0); assert.deepEqual(paths, []); }
     else { assert.equal(result.drops, 0); assert.equal(paths.filter(path => path.includes('/drops')).length, 3); }
+  });
+}
+
+const chainSettings = { PRACTICE_CHAINS: 'base,arbitrum', MUTED_CHAINS: 'robinhood' };
+for (const [chain, policy] of Object.entries({
+  robinhood: 'muted', base: 'practice', arbitrum: 'practice', ethereum: 'normal',
+  optimism: 'normal', ink: 'normal', arc: 'normal', hyperevm: 'normal',
+})) {
+  test(`${chain} effective policy is ${policy}; live observation follows policy`, async () => {
+    const { chainPolicy } = await import('../src/current.js');
+    const f = fixture();
+    const settings = { ...chainSettings, TARGET_CHAINS: chain };
+    const config = getConfig({ ...env, ...settings });
+    assert.equal(chainPolicy(config, chain), policy);
+    f.api.getChains = async () => ({ chains: [{ chain }] });
+    const live = { ...stage, start_time: iso(now - 60) };
+    f.set({ ...drop, chain, active_stage: live, next_stage: null, stages: [live] });
+    assert.equal((await f.discovery(0, settings)).alerts, policy === 'practice' ? 1 : 0);
+    assert.equal(f.calls.details.length, policy === 'muted' ? 0 : 1);
+    if (policy === 'normal') assert.equal((await f.watch(60, settings)).alerts, 1);
+    if (policy === 'muted') {
+      assert.equal(await f.state.getStageWatch(`${chain}:test:a`), null);
+      assert.equal((await f.watch(60, settings)).candidates, 0);
+    }
+  });
+  for (const [name, change, dropChange] of [
+    ['wallet ceiling', { max_per_wallet: '11' }, {}],
+    ['supply floor', {}, { max_supply: 149 }],
+    ['paid', { price: '1' }, {}],
+    ['allowlist', { stage_type: 'presale' }, {}],
+    ['sold out', {}, { total_supply: 150 }],
+  ]) {
+    test(`${chain} applies ${name} under ${policy} policy`, async () => {
+      const f = fixture(), settings = { ...chainSettings, TARGET_CHAINS: chain };
+      f.api.getChains = async () => ({ chains: [{ chain }] });
+      const live = { ...stage, start_time: iso(now - 60), ...change };
+      f.set({ ...drop, chain, ...dropChange, next_stage: live, stages: [live] });
+      const bypass = policy === 'practice' && ['wallet ceiling', 'supply floor'].includes(name);
+      assert.equal((await f.discovery(0, settings)).alerts, bypass ? 1 : 0);
+      assert.equal(Boolean(await f.state.getStageWatch(`${chain}:test:a`)), bypass);
+    });
+  }
+}
+test('policy lists normalize, deduplicate, override legacy mode, and mute takes precedence', async () => {
+  const { chainPolicy } = await import('../src/current.js');
+  const config = getConfig({ ...env, PRACTICE_MODE: 'true',
+    PRACTICE_CHAINS: ' Base,ARBITRUM,base, Robinhood, ', MUTED_CHAINS: ' Robinhood,ROBINHOOD ' });
+  assert.deepEqual(config.practiceChains, ['base', 'arbitrum', 'robinhood']);
+  assert.deepEqual(config.mutedChains, ['robinhood']);
+  assert.equal(chainPolicy(config, 'ROBINHOOD'), 'muted');
+  assert.equal(chainPolicy(config, 'ethereum'), 'normal');
+});
+test('muting historical alerted and unalerted watches preserves all history without detail calls', async () => {
+  const f = fixture();
+  await f.discovery();
+  const original = await f.state.getStageWatch('base:test:a');
+  for (const slug of ['old-alert', 'old-candidate']) {
+    await f.state.saveStageWatch({ ...original, chain: 'robinhood', slug, stage_key: `robinhood:${slug}:a`, last_max_per_wallet: '100' });
+  }
+  await f.state.markAlert({ key: 'robinhood:old-alert:a', chain: 'robinhood', slug: 'old-alert', stageUuid: 'a', sentAt: now });
+  const before = f.sql.prepare("SELECT * FROM stage_watch WHERE chain = 'robinhood'").all();
+  const alerts = f.sql.prepare('SELECT * FROM alerts').all();
+  const settings = { ...chainSettings, TARGET_CHAINS: 'robinhood', MAX_FALLBACK_DETAILS: '12' };
+  f.api.getChains = async () => ({ chains: [{ chain: 'robinhood' }] });
+  f.set({ ...drop, chain: 'robinhood', collection_slug: 'old-alert', total_supply: 150 });
+  f.calls.details = [];
+  assert.equal((await f.discovery(300, settings)).alerts, 0);
+  assert.equal((await f.watch(360, settings)).candidates, 0);
+  assert.deepEqual(f.calls.details, []);
+  assert.deepEqual(f.sql.prepare("SELECT * FROM stage_watch WHERE chain = 'robinhood'").all(), before);
+  assert.deepEqual(f.sql.prepare('SELECT * FROM alerts').all(), alerts);
+});
+test('watch SQL bypasses wallet ceiling only for practice chains, preserving alerted normal monitoring', async () => {
+  const f = fixture(); await f.discovery();
+  const original = await f.state.getStageWatch('base:test:a');
+  for (const chain of ['base', 'arbitrum', 'ethereum', 'optimism', 'robinhood']) {
+    await f.state.saveStageWatch({ ...original, chain, stage_key: `${chain}:test:a`, last_max_per_wallet: '99' });
+  }
+  const settings = getConfig({ ...env, ...chainSettings, TARGET_CHAINS: 'base,arbitrum,ethereum,optimism,robinhood' });
+  assert.deepEqual((await f.state.getWatchCandidates(now + 60, settings)).map(r => r.chain).sort(), ['arbitrum', 'base']);
+  await f.state.markAlert({ key: 'ethereum:test:a', chain: 'ethereum', slug: 'test', stageUuid: 'a', sentAt: now });
+  assert.deepEqual((await f.state.getWatchCandidates(now + 60, settings)).map(r => r.chain).sort(), ['arbitrum', 'base', 'ethereum']);
+});
+test('/diag exposes effective policy for every target chain', async t => {
+  const { default: worker } = await import('../src/index.js');
+  t.mock.method(globalThis, 'fetch', async input => Response.json(String(input).endsWith('/chains') ? { chains: [] } : { drops: [] }));
+  const response = await worker.fetch(new Request('https://example.test/diag', {
+    method: 'POST', headers: { authorization: 'Bearer local-test' },
+  }), { ...env, ...chainSettings, TARGET_CHAINS: undefined, CONTROL_TOKEN: 'local-test' });
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).chainPolicy, {
+    robinhood: 'muted', base: 'practice', optimism: 'normal', ethereum: 'normal',
+    ink: 'normal', arc: 'normal', hyperevm: 'normal', arbitrum: 'practice',
+  });
+});
+for (const chain of ['base', 'arbitrum', 'ethereum', 'optimism']) {
+  test(`${chain} keeps upcoming stability and one-time FREE to PAID warning under chain lists`, async () => {
+    const f = fixture(), settings = { ...chainSettings, TARGET_CHAINS: chain };
+    f.api.getChains = async () => ({ chains: [{ chain }] });
+    const practice = ['base', 'arbitrum'].includes(chain);
+    f.set({ ...drop, chain });
+    assert.equal((await f.discovery(0, settings)).alerts, 0);
+    assert.equal((await f.watch(60, settings)).alerts, 0);
+    assert.equal((await f.watch(120, settings)).alerts, 0);
+    assert.equal((await f.watch(600, settings)).alerts, 1);
+    const paid = { ...stage, price: '1' };
+    f.set({ ...drop, chain, next_stage: paid, stages: [paid] });
+    const messages = [];
+    assert.equal((await f.watch(660, settings, async (_, msg) => messages.push(msg))).warnings, 1);
+    assert.equal((await f.watch(720, settings, async (_, msg) => messages.push(msg))).warnings, 0);
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], /FREE → PAID/);
+    if (practice) {
+      const g = fixture();
+      g.api.getChains = f.api.getChains;
+      const upcoming = { ...stage, start_time: iso(now + 600) };
+      g.set({ ...drop, chain, next_stage: upcoming, stages: [upcoming] });
+      assert.equal((await g.discovery(0, settings)).alerts, 1);
+    }
   });
 }

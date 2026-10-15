@@ -1,5 +1,5 @@
 import { detailRefreshSeconds, observeStage } from "./watch.js";
-import { getConfig } from "./current.js";
+import { getConfig, isPracticeChain, isMutedChain, chainPolicy } from "./current.js";
 import { notifyCandidate, sendTelegram } from "./signal.js";
 import { createState } from "./state.js";
 import { OpenSeaNotFound, Tide } from "./tide.js";
@@ -36,9 +36,9 @@ function cacheRow(drop, nowSec, lastDetailAt) {
 }
 
 function eligible(drop, stage, config, nowSec) {
-  if (isSoldOut(drop) || !config.chains.includes(String(drop.chain).toLowerCase())
-    || !isFreePublicStage(stage, nowSec, !config.practiceMode && config.alertFreeAllowlists)) return false;
-  if (config.practiceMode) return true;
+  if (isMutedChain(config, drop.chain) || isSoldOut(drop) || !config.chains.includes(String(drop.chain).toLowerCase())
+    || !isFreePublicStage(stage, nowSec, !isPracticeChain(config, drop.chain) && config.alertFreeAllowlists)) return false;
+  if (isPracticeChain(config, drop.chain)) return true;
   return !(stage.max_per_wallet != null && stage.max_per_wallet !== "" && Number(stage.max_per_wallet) > config.maxAlertPerWallet)
     && !(drop.max_supply != null && drop.max_supply !== "" && Number(drop.max_supply) < config.minAlertSupply);
 }
@@ -48,7 +48,7 @@ async function processStages(entries, deps, notify = true) {
   const { state, config, nowSec } = deps;
   const unique = new Map();
   for (const { drop, stages } of entries) for (const stage of stages || []) {
-    if (stage?.uuid) unique.set(alertKey(drop, stage), { drop, stage });
+    if (!isMutedChain(config, drop.chain) && stage?.uuid) unique.set(alertKey(drop, stage), { drop, stage });
   }
   const keys = [...unique.keys()];
   const watches = state.getStageWatches ? await state.getStageWatches(keys)
@@ -80,7 +80,7 @@ async function processStages(entries, deps, notify = true) {
   if (state.saveStageWatches) await state.saveStageWatches([...pending.values()]);
   else for (const row of pending.values()) await state.saveStageWatch(row);
   for (const { drop, authoritative } of entries) {
-    if (authoritative && isSoldOut(drop)) await state.closeCollectionWatches(drop, nowSec);
+    if (authoritative && !isMutedChain(config, drop.chain) && isSoldOut(drop)) await state.closeCollectionWatches(drop, nowSec);
   }
   return { alerts, warnings, watched: pending.size, watchKeys: new Set([...watches.keys()].filter(key => watches.get(key)).concat([...pending.keys()])) };
 }
@@ -120,7 +120,7 @@ async function calendarScan({ api, state, config, env, nowSec, scanId, telegram 
   }
   const summaries = new Map();
   for (const rows of pages) for (const row of rows) mergeSummary(summaries, row);
-  const drops = [...summaries.values()];
+  const drops = [...summaries.values()].filter(drop => !isMutedChain(config, drop.chain));
 
   let sent = 0;
   const initial = await processStages(drops.map(drop => ({ drop, stages: [drop.active_stage, drop.next_stage] })),
@@ -180,7 +180,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
   const last = Number(raw || 0);
   if (nowSec - last < config.collectionSweepSeconds || config.maxFallbackDetails === 0) return { alerts: 0, warnings: 0, details: 0, watched: 0 };
 
-  const pages = await Promise.all(config.chains.map(async (chain) => {
+  const pages = await Promise.all(config.chains.filter(chain => !isMutedChain(config, chain)).map(async (chain) => {
     try {
       const payload = await api.listCollections(chain, config.collectionLimit);
       return (payload.collections || []).map((row) => ({ ...row, _chain: chain }));
@@ -196,6 +196,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
       const slug = row.collection || row.collection_slug;
       if (!slug) continue;
       const chain = row.contracts?.find((x) => config.chains.includes(x.chain))?.chain || row._chain;
+      if (isMutedChain(config, chain)) continue;
       const key = `${chain}:${slug}`;
       if (summaries.has(key)) continue;
       if (!candidates.has(slug)) candidates.set(slug, { slug, chain });
@@ -212,7 +213,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
   await mapLimit(filtered, 4, async (slug) => {
     try {
       const detail = await api.getDrop(slug);
-      if (!config.chains.includes(detail.chain)) return;
+      if (!config.chains.includes(detail.chain) || isMutedChain(config, detail.chain)) return;
       observations.push({ drop: detail, stages: detail.stages || [], authoritative: true });
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(slug);
@@ -254,6 +255,7 @@ export async function runWatchScan(env, deps = {}) {
   const candidates = await state.getWatchCandidates(nowSec, config);
   const groups = new Map();
   for (const row of candidates) {
+    if (isMutedChain(config, row.chain)) continue;
     const key = `${row.chain}:${row.slug}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
@@ -369,7 +371,7 @@ export default {
           }
         }
 
-        return jsonResponse({ ok: true, checks });
+        return jsonResponse({ ok: true, checks, chainPolicy: Object.fromEntries(config.chains.map(chain => [chain, chainPolicy(config, chain)])) });
       }
 
       const mode = url.searchParams.get("mode") || "discovery";

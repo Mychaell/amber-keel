@@ -11,7 +11,8 @@
   },
   "vars": {
     "TARGET_CHAINS": "robinhood,base,optimism,ethereum,ink,arc,hyperevm,arbitrum",
-    "PRACTICE_MODE": "true",
+    "PRACTICE_CHAINS": "base,arbitrum",
+    "MUTED_CHAINS": "robinhood",
     "DETAIL_REFRESH_SECONDS": "300",
     "STABILITY_MIN_SECONDS": "600",
     "STABILITY_MIN_OBSERVATIONS": "3",

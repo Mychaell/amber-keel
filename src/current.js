@@ -15,6 +15,25 @@ function boolVar(env, name, fallback = false) {
   return /^(1|true|yes|on)$/i.test(String(raw));
 }
 
+function chainList(raw) {
+  return [...new Set(String(raw).split(",").map(x => x.trim().toLowerCase()).filter(Boolean))];
+}
+
+// Explicit chain lists take precedence over the temporary legacy flag.
+export function isMutedChain(config, chain) {
+  return (config.mutedChains || []).includes(String(chain || "").toLowerCase());
+}
+
+export function isPracticeChain(config, chain) {
+  return !isMutedChain(config, chain) && (config.practiceChains
+    ? config.practiceChains.includes(String(chain || "").toLowerCase())
+    : Boolean(config.practiceMode));
+}
+
+export function chainPolicy(config, chain) {
+  return isMutedChain(config, chain) ? "muted" : isPracticeChain(config, chain) ? "practice" : "normal";
+}
+
 export function getConfig(env) {
   const chains = String(env.TARGET_CHAINS || DEFAULT_CHAINS.join(","))
     .split(",")
@@ -44,6 +63,9 @@ export function getConfig(env) {
     collectionLimit: intVar(env, "COLLECTION_LIMIT", 12, 1, 100),
     maxFallbackDetails: intVar(env, "MAX_FALLBACK_DETAILS", 12, 0, 100),
     missTtlSeconds: intVar(env, "MISS_TTL_SECONDS", 21600, 300, 604800),
+    practiceChains: chainList(env.PRACTICE_CHAINS ?? (env.PRACTICE_MODE != null
+      ? (boolVar(env, "PRACTICE_MODE") ? chains.join(",") : "") : "base,arbitrum")),
+    mutedChains: chainList(env.MUTED_CHAINS ?? "robinhood"),
     practiceMode: boolVar(env, "PRACTICE_MODE", false),
     alertFreeAllowlists: boolVar(env, "ALERT_FREE_ALLOWLISTS", false),
     maxAlertPerWallet: intVar(env, "MAX_ALERT_PER_WALLET", 10, 1, 1000000),

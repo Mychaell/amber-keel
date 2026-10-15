@@ -1,3 +1,5 @@
+import { isMutedChain, isPracticeChain } from "./current.js";
+
 function watchStatement(db, row) {
   const columns = Object.keys(row).filter(x => x !== "alerted");
   const sameConfig = ["last_price", "last_start_time", "last_end_time", "last_max_per_wallet", "last_stage_type"]
@@ -40,7 +42,11 @@ export function createState(db) {
     },
 
     async getWatchCandidates(nowSec, config) {
-      const types = !config.practiceMode && config.alertFreeAllowlists
+      const chains = config.chains.filter(chain => !isMutedChain(config, chain));
+      if (!chains.length) return [];
+      const practiceChains = chains.filter(chain => isPracticeChain(config, chain));
+      const practiceSql = practiceChains.length ? `w.chain IN (${practiceChains.map(() => "?").join(",")})` : "0";
+      const types = config.alertFreeAllowlists
         ? "'public_sale','presale','allowlist','whitelist','signed_presale'" : "'public_sale'";
       const result = await db.prepare(`WITH relevant AS (
           SELECT alert_key AS stage_key FROM alerts
@@ -54,13 +60,14 @@ export function createState(db) {
         JOIN stage_watch w ON w.stage_key = r.stage_key
         LEFT JOIN alerts a ON a.alert_key = w.stage_key
         WHERE (w.last_end_time IS NULL OR CAST(w.last_end_time AS INTEGER) > ?)
-        AND w.chain IN (${config.chains.map(() => "?").join(",")})
-        AND (? = 1 OR a.alert_key IS NOT NULL OR w.last_max_per_wallet IS NULL OR CAST(w.last_max_per_wallet AS INTEGER) <= ?)
+        AND w.chain IN (${chains.map(() => "?").join(",")})
+        AND (${practiceSql} OR a.alert_key IS NOT NULL OR w.last_max_per_wallet IS NULL OR CAST(w.last_max_per_wallet AS INTEGER) <= ?)
+        AND (a.alert_key IS NOT NULL OR w.last_stage_type = 'public_sale' OR NOT (${practiceSql}))
         AND w.last_seen_at <= ?
         ORDER BY (a.alert_key IS NOT NULL) DESC,
           (CAST(w.last_start_time AS INTEGER) <= ?) DESC, CAST(w.last_start_time AS INTEGER), w.last_seen_at`)
-        .bind(nowSec, nowSec + config.watchWindowSeconds, nowSec, ...config.chains,
-          config.practiceMode ? 1 : 0, config.maxAlertPerWallet, nowSec - config.watchRefreshSeconds, nowSec).all();
+        .bind(nowSec, nowSec + config.watchWindowSeconds, nowSec, ...chains,
+          ...practiceChains, config.maxAlertPerWallet, ...practiceChains, nowSec - config.watchRefreshSeconds, nowSec).all();
       return (result.results || []).map(row => ({ ...row, alerted: Boolean(row.alerted) }));
     },
 

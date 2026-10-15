@@ -1,3 +1,4 @@
+import { isPracticeChain, isMutedChain } from "./current.js";
 import { observeStage, isStable } from "./watch.js";
 import { alertKey, isSoldOut, fmtInteger, fmtUtc, isFreePublicStage, stageStatus, parseWei, parseIsoSeconds } from "./util.js";
 
@@ -76,7 +77,8 @@ export async function notifyCandidate({
   config = { stabilityMinSeconds: 600, stabilityMinObservations: 3, upcomingAlertWindowSeconds: 600, liveMinObservations: 2 },
   telegram = sendTelegram,
 }) {
-  if (!stage?.uuid) return false;
+  if (!stage?.uuid || isMutedChain(config, drop.chain)) return false;
+  const practice = isPracticeChain(config, drop.chain);
   const key = alertKey(drop, stage);
   const watch = await observeStage({ drop, stage, state, nowSec, scanId });
   const alerted = await state.hasAlert(key);
@@ -92,21 +94,21 @@ export async function notifyCandidate({
     await state.saveStageWatch({ ...watch, paid_warning_sent: 1 });
     return true;
   }
-  if (isSoldOut(drop) || alerted || !isFreePublicStage(stage, nowSec, !config.practiceMode && allowFreeAllowlists)) return false;
-  if (config.practiceMode) {
+  if (isSoldOut(drop) || alerted || !isFreePublicStage(stage, nowSec, !practice && allowFreeAllowlists)) return false;
+  if (practice) {
     if (config.chains && !config.chains.includes(String(drop.chain).toLowerCase())) return false;
     if (stageStatus(stage, nowSec) === "UPCOMING"
       && parseIsoSeconds(stage.start_time) - nowSec > config.upcomingAlertWindowSeconds) return false;
   } else if (!isStable(watch, stage, nowSec, config)) return false;
 
   const rawLimit = stage?.max_per_wallet;
-  if (!config.practiceMode && rawLimit != null && rawLimit !== "") {
+  if (!practice && rawLimit != null && rawLimit !== "") {
     const perWallet = Number(rawLimit);
     if (Number.isFinite(perWallet) && perWallet > maxAlertPerWallet) return false;
   }
 
   const rawSupply = drop?.max_supply;
-  if (!config.practiceMode && rawSupply != null && rawSupply !== "") {
+  if (!practice && rawSupply != null && rawSupply !== "") {
     const maxSupply = Number(rawSupply);
     if (Number.isFinite(maxSupply) && maxSupply < minAlertSupply) return false;
   }
