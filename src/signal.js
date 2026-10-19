@@ -76,11 +76,12 @@ export async function notifyCandidate({
   scanId,
   config = { stabilityMinSeconds: 600, stabilityMinObservations: 3, upcomingAlertWindowSeconds: 600, liveMinObservations: 2 },
   telegram = sendTelegram,
+  metrics,
 }) {
   if (!stage?.uuid || isMutedChain(config, drop.chain)) return false;
   const practice = isPracticeChain(config, drop.chain);
   const key = alertKey(drop, stage);
-  const watch = await observeStage({ drop, stage, state, nowSec, scanId });
+  const watch = await observeStage({ drop, stage, state, nowSec, scanId, config });
   const alerted = await state.hasAlert(key);
   const price = parseWei(stage.price);
   if (alerted && price != null && price !== 0n && !watch.paid_warning_sent) {
@@ -99,7 +100,10 @@ export async function notifyCandidate({
     if (config.chains && !config.chains.includes(String(drop.chain).toLowerCase())) return false;
     if (stageStatus(stage, nowSec) === "UPCOMING"
       && parseIsoSeconds(stage.start_time) - nowSec > config.upcomingAlertWindowSeconds) return false;
-  } else if (!isStable(watch, stage, nowSec, config)) return false;
+  } else if (!isStable(watch, stage, nowSec, config)) {
+    if (metrics) metrics.unstableSkipped++;
+    return false;
+  }
 
   const rawLimit = stage?.max_per_wallet;
   if (!practice && rawLimit != null && rawLimit !== "") {
@@ -114,20 +118,29 @@ export async function notifyCandidate({
   }
 
   const message = buildMessage(drop, stage, nowSec);
+  // Reserve durably before sending; a failed D1 write must never send a mint alert.
+  const claimed = await state.reserveAlert({
+    key, chain: drop.chain || "unknown", slug: drop.collection_slug,
+    stageUuid: stage.uuid, claimTimestamp: nowSec, ttlSeconds: config.alertClaimTtlSeconds ?? 300, openseaUrl: drop.opensea_url || null,
+  });
+  if (!claimed) return false;
   try {
     await telegram(env, message);
   } catch (err) {
+    try {
+      await state.releaseAlert(key, nowSec);
+    } catch (releaseError) {
+      console.error(`alert release failed ${key}; pending claim will expire: ${releaseError.message}`);
+    }
     console.error(`telegram failed ${key}: ${err.message}`);
     return false;
   }
-
-  await state.markAlert({
-    key,
-    chain: drop.chain || "unknown",
-    slug: drop.collection_slug,
-    stageUuid: stage.uuid,
-    sentAt: nowSec,
-    openseaUrl: drop.opensea_url || null,
-  });
+  try {
+    if (!await state.confirmAlert(key, nowSec, Math.floor(Date.now() / 1000))) {
+      throw new Error("claim no longer owned");
+    }
+  } catch (err) {
+    console.error(`Telegram delivery succeeded but alert confirmation failed ${key}; pending claim remains recoverable: ${err.message}`);
+  }
   return true;
 }

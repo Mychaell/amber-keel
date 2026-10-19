@@ -1,3 +1,4 @@
+import { isPracticeChain } from "./current.js";
 import { alertKey, isFreePublicStage, parseIsoSeconds, parseWei, stageStatus } from "./util.js";
 
 const fields = {
@@ -8,27 +9,35 @@ const fields = {
   last_stage_type: stage => stage.stage_type ?? null,
 };
 
-export async function observeStage({ drop, stage, state, nowSec, scanId = String(Math.floor(nowSec / 60)) }) {
+export async function observeStage({ drop, stage, state, nowSec, scanId, config = {} }) {
   const key = alertKey(drop, stage);
   const previous = await state.getStageWatch(key);
   const values = Object.fromEntries(Object.entries(fields).map(([name, read]) => [name, read(stage)]));
   const changed = previous && Object.keys(fields).some(name => previous[name] !== values[name]);
   const free = parseWei(stage.price) === 0n;
   const paid = parseWei(stage.price) != null && parseWei(stage.price) !== 0n;
-  const sameScan = previous?.last_observed_scan_at === String(scanId);
+  // UTC minute is the observation bucket, regardless of caller scan identifiers.
+  scanId = String(Math.floor(nowSec / 60));
+  const sameScan = previous?.last_observed_scan_at === scanId;
+  const minimum = previous?.first_seen_live && !previous?.ever_seen_paid
+    ? (config.liveMinObservations ?? 2) : (config.stabilityMinObservations ?? 3);
+  const advance = free && !isPracticeChain(config, drop.chain) && !sameScan
+    && Number(previous?.consecutive_free_observations ?? 0) < minimum;
   const row = {
     stage_key: key, chain: String(drop.chain || "unknown").toLowerCase(), slug: drop.collection_slug, stage_uuid: stage.uuid,
     first_seen_at: previous?.first_seen_at ?? nowSec,
     first_free_at: free ? (changed ? nowSec : previous?.first_free_at ?? nowSec) : null,
     last_seen_at: nowSec, last_observed_scan_at: String(scanId),
-    consecutive_free_observations: free ? (changed || previous?.first_free_at == null ? 1 : Number(previous.consecutive_free_observations) + (sameScan ? 0 : 1)) : 0,
+    consecutive_free_observations: free ? (changed || previous?.first_free_at == null ? 1 : Number(previous.consecutive_free_observations) + (advance ? 1 : 0)) : 0,
     ...values,
     last_changed_at: changed ? nowSec : previous?.last_changed_at ?? nowSec,
     ever_seen_paid: paid || previous?.ever_seen_paid ? 1 : 0,
     paid_warning_sent: previous?.paid_warning_sent ?? 0,
     first_seen_live: previous?.first_seen_live ?? (stageStatus(stage, nowSec) === "LIVE" ? 1 : 0),
   };
-  await state.saveStageWatch(row);
+  if (!previous || changed || advance || row.first_seen_live !== previous.first_seen_live
+    || row.ever_seen_paid !== previous.ever_seen_paid) await state.saveStageWatch(row);
+  else return previous;
   return row;
 }
 

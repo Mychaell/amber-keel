@@ -540,3 +540,276 @@ for (const chain of ['base', 'arbitrum', 'ethereum', 'optimism']) {
     }
   });
 }
+
+for (const alerted of [false, true]) {
+  test(`unchanged practice watch performs zero stage writes, alerted=${alerted}`, async () => {
+    const f = fixture(); await f.discovery();
+    if (alerted) await f.state.markAlert({ key: 'base:test:a', chain: 'base', slug: 'test', stageUuid: 'a', sentAt: now });
+    const before = await f.state.getStageWatch('base:test:a');
+    let writes = 0;
+    const save = f.state.saveStageWatches;
+    f.state.saveStageWatches = async rows => { writes += rows.length; return save(rows); };
+    await f.watch(60, { PRACTICE_MODE: 'true' });
+    assert.equal(writes, 0);
+    assert.deepEqual(await f.state.getStageWatch('base:test:a'), before);
+    assert.equal(f.calls.details.length, 2);
+  });
+}
+for (const [name, changes] of Object.entries({ paid: { price: '1' }, start: { start_time: iso(now + 1300) }, wallet: { max_per_wallet: '9' } })) {
+  test(`practice ${name} change persists once`, async () => {
+    const f = fixture(); await f.discovery();
+    let writes = 0;
+    const save = f.state.saveStageWatches;
+    f.state.saveStageWatches = async rows => { writes += rows.length; return save(rows); };
+    const changed = { ...stage, ...changes };
+    f.set({ ...drop, next_stage: changed, stages: [changed] });
+    await f.watch(60, { PRACTICE_MODE: 'true' });
+    assert.equal(writes, 1);
+    if (name === 'paid') {
+      f.set(drop); await f.discovery(120, { PRACTICE_MODE: 'true' });
+      assert.equal(writes, 2);
+      assert.equal((await f.state.getStageWatch('base:test:a')).last_price, '0');
+    }
+  });
+}
+test('normal observation writes once per UTC minute then stops at minimum count', async () => {
+  const f = fixture(); await f.discovery();
+  let writes = 0;
+  const save = f.state.saveStageWatches;
+  f.state.saveStageWatches = async rows => { writes += rows.length; return save(rows); };
+  await f.watch(60); assert.equal(writes, 1);
+  // Force another poll in the same minute, with a one second refresh.
+  await f.watch(61, { WATCH_REFRESH_SECONDS: '1' }); assert.equal(writes, 1);
+  await f.watch(121); assert.equal(writes, 2);
+  await f.watch(600); await f.watch(660); assert.equal(writes, 2);
+  assert.equal(await f.state.hasAlert('base:test:a'), true);
+});
+for (const differs of [false, true]) {
+  test(`discovery persists only final authoritative stage, differs=${differs}`, async () => {
+    const f = fixture(); const saved = [];
+    const save = f.state.saveStageWatches;
+    f.state.saveStageWatches = async rows => { saved.push(...rows); return save(rows); };
+    const authoritative = { ...stage, max_per_wallet: differs ? '9' : '10' };
+    f.api.getDrop = async () => ({ ...drop, stages: [authoritative] });
+    await f.discovery();
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].last_max_per_wallet, authoritative.max_per_wallet);
+  });
+}
+for (const method of ['saveStageWatches', 'reserveAlert']) {
+  test(`D1 quota failure in ${method} aborts scan before Telegram`, async t => {
+    const f = fixture(); let sends = 0; const logs = [];
+    t.mock.method(console, 'error', msg => logs.push(msg));
+    f.state[method] = async () => { throw new Error('D1 daily row-write limit exceeded'); };
+    await assert.rejects(runDiscoveryScan({ ...env, PRACTICE_MODE: 'true' }, {
+      state: f.state, api: f.api, nowSec: now + 600, telegram: async () => { sends++; },
+    }), /row-write limit exceeded/);
+    assert.equal(sends, 0);
+    assert.equal(await f.state.hasAlert('base:test:a'), false);
+    assert.ok(logs.some(msg => msg.includes('D1 quota/write failure')));
+  });
+}
+test('identical cache, settings, miss writes and absent clearMiss change no rows', async () => {
+  const f = fixture();
+  const row = { dropKey: 'base:test', activeUuid: 'a', lastDetailAt: now, lastSeenAt: now };
+  await f.state.upsertCache(row); await f.state.setSetting('example', '1', now); await f.state.markMiss('absent', now);
+  const before = f.sql.prepare('SELECT total_changes() AS n').get().n;
+  await f.state.upsertCache({ ...row, lastSeenAt: now + 60 });
+  await f.state.setSetting('example', '1', now + 60); await f.state.markMiss('absent', now);
+  await f.state.clearMiss('never-existed');
+  assert.equal(f.sql.prepare('SELECT total_changes() AS n').get().n, before);
+});
+test('scan logs include aggregate write and filter diagnostics', async t => {
+  const logs = []; t.mock.method(console, 'log', msg => logs.push(msg));
+  const f = fixture(); await f.discovery(); await f.watch();
+  for (const mode of ['discovery', 'watch']) {
+    const line = logs.find(msg => msg.startsWith(`${mode}:`));
+    for (const field of ['writes', 'rowsWritten', 'writeFailures', 'normalCandidates', 'practiceCandidates', 'mutedSkipped',
+      'unstableSkipped', 'walletLimitSkipped', 'supplySkipped', 'soldOutSkipped', 'paidSkipped', 'allowlistSkipped']) assert.match(line, new RegExp(`${field}=\\d+`));
+  }
+});
+test('production D1 metrics count statements and affected rows', async () => {
+  const f = fixture();
+  const result = await runWatchScan(env, { state: f.state, api: f.api, nowSec: now });
+  assert.equal(result.writes, 0);
+  const metrics = { writes: 0, rowsWritten: 0 };
+  const state = createState(f.db, metrics);
+  await state.setSetting('metric', '1', now);
+  await state.setSetting('metric', '1', now + 60);
+  assert.equal(metrics.writes, 2); assert.equal(metrics.rowsWritten, 1);
+});
+
+// Durable alert claims use the existing sent_at column; exercise real SQLite SQL.
+const claimKey = 'base:test:a';
+const claimRow = timestamp => ({ key: claimKey, chain: 'base', slug: 'test',
+  stageUuid: 'a', claimTimestamp: timestamp, ttlSeconds: 300 });
+const claimValue = f => f.sql.prepare('SELECT sent_at FROM alerts WHERE alert_key = ?').get(claimKey)?.sent_at;
+async function claimFixture() {
+  const f = fixture();
+  await f.discovery(0, { PRACTICE_MODE: 'true' });
+  const { notifyCandidate } = await import('../src/signal.js');
+  f.notify = (seconds = 0, telegram = async () => {}, changes = {}) => notifyCandidate({
+    drop, stage: { ...stage, start_time: iso(now - 60), ...changes }, state: f.state,
+    env, nowSec: now + seconds, config: getConfig({ ...env, PRACTICE_MODE: 'true' }), telegram,
+  });
+  return f;
+}
+
+test('claim: reservation precedes Telegram and successful delivery is confirmed', async () => {
+  const f = await claimFixture();
+  assert.equal(await f.notify(0, async () => assert.equal(claimValue(f), -now)), true);
+  assert.ok(claimValue(f) > 0);
+  assert.equal(await f.state.hasAlert(claimKey), true);
+});
+test('claim: historical positive alert suppresses duplicate and remains unchanged', async () => {
+  const f = await claimFixture();
+  await f.state.markAlert({ ...claimRow(now), sentAt: now - 86400 });
+  assert.equal(await f.notify(0, async () => assert.fail('duplicate Telegram')), false);
+  assert.equal(claimValue(f), now - 86400);
+});
+test('claim: pending reservation inside TTL suppresses duplicate', async () => {
+  const f = await claimFixture();
+  assert.equal(await f.state.reserveAlert(claimRow(now)), true);
+  assert.equal(await f.notify(299, async () => assert.fail('duplicate Telegram')), false);
+  assert.equal(claimValue(f), -now);
+});
+test('claim: stale reservation is reclaimed at TTL boundary', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  assert.equal(await f.state.reserveAlert(claimRow(now + 300)), true);
+  assert.equal(claimValue(f), -(now + 300));
+});
+test('claim: Telegram failure releases pending row and permits immediate retry', async () => {
+  const f = await claimFixture();
+  assert.equal(await f.notify(0, async () => { throw new Error('Telegram unavailable'); }), false);
+  assert.equal(claimValue(f), undefined);
+  assert.equal(await f.notify(), true);
+});
+test('claim: Telegram failure and failed release leave a negative unconfirmed claim', async () => {
+  const f = await claimFixture();
+  f.state.releaseAlert = async () => { throw new Error('D1 quota blocked'); };
+  assert.equal(await f.notify(0, async () => { throw new Error('Telegram unavailable'); }), false);
+  assert.equal(claimValue(f), -now);
+  assert.equal(await f.state.hasAlert(claimKey), false);
+});
+test('claim: failed release becomes retryable after TTL', async () => {
+  const f = await claimFixture();
+  f.state.releaseAlert = async () => { throw new Error('D1 quota blocked'); };
+  await f.notify(0, async () => { throw new Error('Telegram unavailable'); });
+  assert.equal(await f.notify(299), false);
+  assert.equal(await f.notify(300), true);
+  assert.ok(claimValue(f) > 0);
+});
+test('claim: interruption after durable reservation recovers after TTL', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now)); // Worker terminates here, without cleanup.
+  assert.equal(await f.notify(299), false);
+  assert.equal(await f.notify(300), true);
+  assert.ok(claimValue(f) > 0);
+});
+test('claim: Telegram success and confirm failure leave recoverable pending state', async () => {
+  const f = await claimFixture();
+  const confirm = f.state.confirmAlert;
+  f.state.confirmAlert = async () => { throw new Error('D1 quota blocked'); };
+  let messages = 0;
+  assert.equal(await f.notify(0, async () => messages++), true);
+  assert.equal(claimValue(f), -now);
+  assert.equal(await f.state.hasAlert(claimKey), false);
+  assert.equal(await f.notify(299, async () => messages++), false);
+  f.state.confirmAlert = confirm;
+  assert.equal(await f.notify(300, async () => messages++), true);
+  assert.equal(messages, 2);
+  assert.ok(claimValue(f) > 0);
+});
+test('claim: hasAlert returns false for pending rows', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  assert.equal(await f.state.hasAlert(claimKey), false);
+});
+test('claim: hasAlert returns true for confirmed positive rows', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  assert.equal(await f.state.confirmAlert(claimKey, now, now + 1), true);
+  assert.equal(await f.state.hasAlert(claimKey), true);
+});
+test('claim: stage watch joins exclude pending alerts', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  assert.equal((await f.state.getStageWatches([claimKey])).get(claimKey).alerted, false);
+  assert.deepEqual(await f.state.getAlertedWatches(), []);
+});
+test('claim: watch candidates treat pending as unconfirmed and preserve eligibility filters', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  const settings = getConfig({ ...env, PRACTICE_MODE: 'true' });
+  const candidates = await f.state.getWatchCandidates(now + 60, settings);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].alerted, false);
+  f.sql.prepare("UPDATE stage_watch SET last_max_per_wallet = '11'").run();
+  assert.deepEqual(await f.state.getWatchCandidates(now + 120, getConfig(env)), []);
+});
+test('claim: historical positive rows still join and receive FREE to PAID warning', async () => {
+  const f = await claimFixture();
+  await f.state.markAlert({ ...claimRow(now), sentAt: now - 86400 });
+  assert.equal((await f.state.getStageWatches([claimKey])).get(claimKey).alerted, true);
+  assert.equal((await f.state.getAlertedWatches()).length, 1);
+  assert.equal((await f.state.getWatchCandidates(now + 60, getConfig(env)))[0].alerted, true);
+  let messages = 0;
+  await f.notify(120, async (_, message) => { assert.match(message, /FREE → PAID/); messages++; }, { price: '1' });
+  assert.equal(messages, 1);
+  assert.equal(claimValue(f), now - 86400);
+});
+test('claim: initial reservation D1 failure never sends Telegram', async () => {
+  const f = await claimFixture();
+  f.state.reserveAlert = async () => { throw new Error('D1 quota blocked'); };
+  await assert.rejects(f.notify(0, async () => assert.fail('unsafe Telegram')), /D1 quota blocked/);
+  assert.equal(claimValue(f), undefined);
+});
+test('claim: concurrent notification attempts have only one sender', async () => {
+  const f = await claimFixture();
+  let messages = 0;
+  const results = await Promise.all(Array.from({ length: 8 }, () => f.notify(0, async () => { messages++; })));
+  assert.equal(messages, 1);
+  assert.equal(results.filter(Boolean).length, 1);
+  assert.ok(claimValue(f) > 0);
+});
+test('claim: stale owners cannot release or confirm a newer claim or confirmed history', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  await f.state.reserveAlert(claimRow(now + 300));
+  assert.equal(await f.state.confirmAlert(claimKey, now, now + 301), false);
+  await f.state.releaseAlert(claimKey, now);
+  assert.equal(claimValue(f), -(now + 300));
+  assert.equal(await f.state.confirmAlert(claimKey, now + 300, now + 301), true);
+  await f.state.releaseAlert(claimKey, now + 300);
+  assert.equal(claimValue(f), now + 301);
+  assert.equal(await f.state.reserveAlert(claimRow(now + 900)), false);
+});
+test('claim: pending FREE alert never triggers a paid-switch warning', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  assert.equal(await f.notify(60, async () => assert.fail('unconfirmed warning'), { price: '1' }), false);
+  assert.equal(claimValue(f), -now);
+});
+test('claim: configured TTL governs reservation lifetime', async () => {
+  const f = await claimFixture();
+  assert.equal(getConfig(env).alertClaimTtlSeconds, 300);
+  const settings = getConfig({ ...env, ALERT_CLAIM_TTL_SECONDS: '600' });
+  assert.equal(settings.alertClaimTtlSeconds, 600);
+  await f.state.reserveAlert({ ...claimRow(now), ttlSeconds: settings.alertClaimTtlSeconds });
+  assert.equal(await f.state.reserveAlert({ ...claimRow(now + 599), ttlSeconds: settings.alertClaimTtlSeconds }), false);
+  assert.equal(await f.state.reserveAlert({ ...claimRow(now + 600), ttlSeconds: settings.alertClaimTtlSeconds }), true);
+  assert.throws(() => getConfig({ ...env, ALERT_CLAIM_TTL_SECONDS: '0' }), /ALERT_CLAIM_TTL_SECONDS/);
+});
+
+
+test('claim: pending upcoming watch remains retryable after it goes live', async () => {
+  const f = await claimFixture();
+  await f.state.reserveAlert(claimRow(now));
+  const settings = getConfig(env);
+  // This stage was first seen upcoming, so first_seen_live cannot select it.
+  const candidates = await f.state.getWatchCandidates(now + 1201, settings);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].alerted, false);
+  assert.equal(await f.notify(1201), true);
+});

@@ -14,7 +14,7 @@ function fixture(overrides = {}) {
   const state = {
     getStageWatch: async key => watches.get(key) || null,
     saveStageWatch: async row => watches.set(row.stage_key, { ...row }),
-    hasAlert: async key => alerts.has(key), markAlert: async ({ key }) => alerts.add(key),
+    hasAlert: async key => alerts.has(key), confirmAlert: async () => true, reserveAlert: async ({ key }) => { alerts.add(key); return true; },
     getAlertedWatches: async () => [...watches.values()].filter(w => alerts.has(w.stage_key)),
   };
   const observe = (seconds, changes = {}, scanId = String(seconds)) => notifyCandidate({ drop, stage: { ...stage, ...overrides, ...changes }, nowSec: now + seconds, scanId, state, env: {}, config, telegram: async (_, msg) => messages.push(msg) });
@@ -110,7 +110,7 @@ test('Worker merges summary and detail into one observation and polls selectivel
   Object.assign(f.state, { getSetting: async () => String(now), getCaches: async () => new Map(cache ? [['base:test', cache]] : []),
     upsertCache: async row => { cache = { active_uuid: row.activeUuid, next_uuid: row.nextUuid, last_detail_at: row.lastDetailAt }; }, clearMiss: async () => {}, markMiss: async () => {} });
   const api = { listDrops: async () => [{ ...drop, next_stage: stage }], getDrop: async () => { detailCalls++; return { ...drop, next_stage: stage, stages: [stage] }; } };
-  const env = { DB: {}, OPENSEA_API_KEY: 'x', TELEGRAM_BOT_TOKEN: 'x', TELEGRAM_CHAT_ID: 'x', MAX_FALLBACK_DETAILS: '0' };
+  const env = { DB: {}, OPENSEA_API_KEY: 'x', TELEGRAM_BOT_TOKEN: 'x', TELEGRAM_CHAT_ID: 'x', MAX_FALLBACK_DETAILS: '0', PRACTICE_MODE: 'false' };
   await runScan(env, { api, state: f.state, nowSec: now, scanId: 'a' });
   assert.equal([...f.watches.values()][0].consecutive_free_observations, 1);
   await runScan(env, { api, state: f.state, nowSec: now + 59, scanId: 'b' });

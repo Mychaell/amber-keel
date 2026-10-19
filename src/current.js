@@ -54,6 +54,7 @@ export function getConfig(env) {
     stabilityMinObservations: intVar(env, "STABILITY_MIN_OBSERVATIONS", 3, 1, 1000),
     upcomingAlertWindowSeconds: intVar(env, "UPCOMING_ALERT_WINDOW_SECONDS", 600, 1, 86400),
     liveMinObservations: intVar(env, "LIVE_MIN_OBSERVATIONS", 2, 1, 1000),
+    alertClaimTtlSeconds: intVar(env, "ALERT_CLAIM_TTL_SECONDS", 300, 1, 86400),
     watchRefreshSeconds: intVar(env, "WATCH_REFRESH_SECONDS", 60, 1, 86400),
     watchWindowSeconds: intVar(env, "WATCH_WINDOW_SECONDS", 1800, 1, 86400),
     maxDetailsPerScan: intVar(env, "MAX_DETAILS_PER_SCAN", 8, 0, 100),

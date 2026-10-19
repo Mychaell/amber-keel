@@ -70,7 +70,7 @@ test("identical stage UUID does not generate a second alert", async () => {
   let telegramCalls = 0;
   const state = {
     hasAlert: async (key) => sent.has(key),
-    markAlert: async ({ key }) => sent.add(key),
+    confirmAlert: async () => true, reserveAlert: async ({ key }) => { sent.add(key); return true; },
   };
   const telegram = async () => { telegramCalls += 1; };
   const args = { drop, stage: stage(), state, env: {}, nowSec: NOW, telegram };
@@ -83,7 +83,7 @@ test("wallet limit of 10 still qualifies for alerting", async () => {
   let telegramCalls = 0;
   const state = {
     hasAlert: async () => false,
-    markAlert: async () => {},
+    confirmAlert: async () => true, reserveAlert: async () => true,
   };
   const telegram = async () => { telegramCalls += 1; };
   const sent = await notifyCandidate({
@@ -104,7 +104,7 @@ test("wallet limit above 10 is filtered from Telegram", async () => {
   let marked = false;
   const state = {
     hasAlert: async () => false,
-    markAlert: async () => { marked = true; },
+    confirmAlert: async () => true, reserveAlert: async () => { marked = true; return true; },
   };
   const telegram = async () => { telegramCalls += 1; };
   const sent = await notifyCandidate({
@@ -125,7 +125,7 @@ test("supply of 150 still qualifies for alerting", async () => {
   let telegramCalls = 0;
   const state = {
     hasAlert: async () => false,
-    markAlert: async () => {},
+    confirmAlert: async () => true, reserveAlert: async () => true,
   };
   const telegram = async () => { telegramCalls += 1; };
   const sent = await notifyCandidate({
@@ -146,7 +146,7 @@ test("supply below 150 is filtered from Telegram", async () => {
   let marked = false;
   const state = {
     hasAlert: async () => false,
-    markAlert: async () => { marked = true; },
+    confirmAlert: async () => true, reserveAlert: async () => { marked = true; return true; },
   };
   const telegram = async () => { telegramCalls += 1; };
   const sent = await notifyCandidate({
@@ -167,7 +167,7 @@ test("unknown max supply is not filtered", async () => {
   let telegramCalls = 0;
   const state = {
     hasAlert: async () => false,
-    markAlert: async () => {},
+    confirmAlert: async () => true, reserveAlert: async () => true,
   };
   const telegram = async () => { telegramCalls += 1; };
   const sent = await notifyCandidate({
@@ -188,7 +188,7 @@ test("different stage UUID on the same collection generates another alert", asyn
   let telegramCalls = 0;
   const state = {
     hasAlert: async (key) => sent.has(key),
-    markAlert: async ({ key }) => sent.add(key),
+    confirmAlert: async () => true, reserveAlert: async ({ key }) => { sent.add(key); return true; },
   };
   const telegram = async () => { telegramCalls += 1; };
   await notifyCandidate({ drop, stage: stage({ uuid: "a" }), state, env: {}, nowSec: NOW, telegram });
@@ -218,7 +218,8 @@ test("Telegram failure does not mark the stage sent", async () => {
   let marked = false;
   const state = {
     hasAlert: async () => false,
-    markAlert: async () => { marked = true; },
+    confirmAlert: async () => true, reserveAlert: async () => { marked = true; return true; },
+    releaseAlert: async () => { marked = false; },
   };
   const telegram = async () => { throw new Error("nope"); };
   assert.equal(await notifyCandidate({ drop, stage: stage(), state, env: {}, nowSec: NOW, telegram }), false);

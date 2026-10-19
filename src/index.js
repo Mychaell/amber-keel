@@ -1,4 +1,4 @@
-import { detailRefreshSeconds, observeStage } from "./watch.js";
+import { detailRefreshSeconds } from "./watch.js";
 import { getConfig, isPracticeChain, isMutedChain, chainPolicy } from "./current.js";
 import { notifyCandidate, sendTelegram } from "./signal.js";
 import { createState } from "./state.js";
@@ -6,6 +6,46 @@ import { OpenSeaNotFound, Tide } from "./tide.js";
 import { alertKey, dropKey, isSoldOut, isFreePublicStage, mapLimit, parseWei } from "./util.js";
 
 const DROP_TYPES = ["featured", "upcoming", "recently_minted"];
+
+function scanState(env, deps, metrics) {
+  const state = deps.state || createState(env.DB, metrics);
+  const writes = new Set(['saveStageWatch', 'saveStageWatches', 'closeStageWatch', 'closeCollectionWatches',
+    'markAlert', 'reserveAlert', 'confirmAlert', 'releaseAlert', 'upsertCache', 'markMiss', 'clearMiss', 'setSetting']);
+  return new Proxy(state, { get(target, name) {
+    const fn = target[name];
+    if (typeof fn !== 'function' || !writes.has(name)) return fn;
+    return async (...args) => {
+      try {
+        const result = await fn(...args);
+        if (deps.state) metrics.writes += name === 'saveStageWatches' ? args[0].length : 1;
+        return result;
+      } catch (err) {
+        metrics.writeFailures++;
+        console.error(`D1 quota/write failure (${name}): ${err.message}`);
+        err.d1WriteFailure = true;
+        throw err;
+      }
+    };
+  } });
+}
+
+function scanMetrics() {
+  return { writes: 0, rowsWritten: 0, writeFailures: 0, normalCandidates: 0, practiceCandidates: 0,
+    mutedSkipped: 0, unstableSkipped: 0, walletLimitSkipped: 0, supplySkipped: 0,
+    soldOutSkipped: 0, paidSkipped: 0, allowlistSkipped: 0 };
+}
+
+function countCandidate(drop, stage, config, metrics) {
+  if (!metrics || !stage?.uuid) return;
+  if (isMutedChain(config, drop.chain)) { metrics.mutedSkipped++; return; }
+  if (parseWei(stage.price) !== 0n) { metrics.paidSkipped++; return; }
+  if (stage.stage_type !== 'public_sale') { metrics.allowlistSkipped++; return; }
+  const practice = isPracticeChain(config, drop.chain);
+  metrics[practice ? 'practiceCandidates' : 'normalCandidates']++;
+  if (isSoldOut(drop)) metrics.soldOutSkipped++;
+  else if (!practice && Number(stage.max_per_wallet) > config.maxAlertPerWallet) metrics.walletLimitSkipped++;
+  else if (!practice && drop.max_supply != null && drop.max_supply !== '' && Number(drop.max_supply) < config.minAlertSupply) metrics.supplySkipped++;
+}
 
 function mergeSummary(map, row) {
   if (!row?.collection_slug || !row?.chain) return;
@@ -44,7 +84,7 @@ function eligible(drop, stage, config, nowSec) {
 }
 
 // One bulk read and batched writes per group, including existing watches that no longer qualify.
-async function processStages(entries, deps, notify = true) {
+async function processStages(entries, deps) {
   const { state, config, nowSec } = deps;
   const unique = new Map();
   for (const { drop, stages } of entries) for (const stage of stages || []) {
@@ -54,22 +94,27 @@ async function processStages(entries, deps, notify = true) {
   const watches = state.getStageWatches ? await state.getStageWatches(keys)
     : new Map(await Promise.all(keys.map(async key => [key, await state.getStageWatch(key)])));
   const pending = new Map();
+  const flush = async () => {
+    const rows = [...pending.values()];
+    if (state.saveStageWatches) await state.saveStageWatches(rows);
+    else for (const row of rows) await state.saveStageWatch(row);
+    pending.clear();
+  };
   const buffered = {
     ...state,
     getStageWatch: async key => pending.get(key) || watches.get(key) || null,
     saveStageWatch: async row => { pending.set(row.stage_key, row); },
+    reserveAlert: async row => { await flush(); return state.reserveAlert(row); },
     hasAlert: async key => state.getStageWatches ? Boolean(watches.get(key)?.alerted) : state.hasAlert(key),
   };
-  let alerts = 0, warnings = 0;
+  let alerts = 0, warnings = 0, watched = 0;
   for (const [key, { drop, stage }] of unique) {
+    countCandidate(drop, stage, config, deps.metrics);
     // Keep closed sold-out watches closed on rediscovery; paid warnings still run.
     if (isSoldOut(drop) && !(parseWei(stage.price) != null && parseWei(stage.price) !== 0n
       && await buffered.hasAlert(key) && !watches.get(key)?.paid_warning_sent)) continue;
     if (!watches.get(key) && !eligible(drop, stage, config, nowSec)) continue;
-    if (!notify && !(parseWei(stage.price) != null && parseWei(stage.price) !== 0n)) {
-      await observeStage({ drop, stage, ...deps, state: buffered });
-      continue;
-    }
+    watched++;
     const warning = await buffered.hasAlert(key) && parseWei(stage.price) != null && parseWei(stage.price) !== 0n;
     if (await notifyCandidate({ drop, stage, ...deps, state: buffered,
       allowFreeAllowlists: config.alertFreeAllowlists, maxAlertPerWallet: config.maxAlertPerWallet,
@@ -77,12 +122,11 @@ async function processStages(entries, deps, notify = true) {
       if (warning) warnings++; else alerts++;
     }
   }
-  if (state.saveStageWatches) await state.saveStageWatches([...pending.values()]);
-  else for (const row of pending.values()) await state.saveStageWatch(row);
+  await flush();
   for (const { drop, authoritative } of entries) {
     if (authoritative && !isMutedChain(config, drop.chain) && isSoldOut(drop)) await state.closeCollectionWatches(drop, nowSec);
   }
-  return { alerts, warnings, watched: pending.size, watchKeys: new Set([...watches.keys()].filter(key => watches.get(key)).concat([...pending.keys()])) };
+  return { alerts, warnings, watched };
 }
 
 async function maybeValidateChains({ api, state, config, nowSec }) {
@@ -96,12 +140,13 @@ async function maybeValidateChains({ api, state, config, nowSec }) {
     if (missing.length) throw new Error(`OpenSea does not report these target chains as supported: ${missing.join(", ")}`);
     await state.setSetting("chains_checked_at", nowSec, nowSec);
   } catch (err) {
+    if (err.d1WriteFailure) throw err;
     if (/does not report these target chains/.test(err.message)) throw err;
     console.warn(`chain validation skipped: ${err.message}`);
   }
 }
 
-async function calendarScan({ api, state, config, env, nowSec, scanId, telegram }) {
+async function calendarScan({ api, state, config, env, nowSec, scanId, telegram, metrics }) {
   let feedSuccesses = 0;
   const feedErrors = [];
   const pages = await Promise.all(DROP_TYPES.map(async (type) => {
@@ -120,14 +165,18 @@ async function calendarScan({ api, state, config, env, nowSec, scanId, telegram 
   }
   const summaries = new Map();
   for (const rows of pages) for (const row of rows) mergeSummary(summaries, row);
+  for (const drop of summaries.values()) if (isMutedChain(config, drop.chain)) {
+    for (const stage of [drop.active_stage, drop.next_stage]) countCandidate(drop, stage, config, metrics);
+  }
   const drops = [...summaries.values()].filter(drop => !isMutedChain(config, drop.chain));
 
   let sent = 0;
-  const initial = await processStages(drops.map(drop => ({ drop, stages: [drop.active_stage, drop.next_stage] })),
-    { state, env, nowSec, scanId, config, telegram }, false);
+  const summaryKeys = drops.flatMap(drop => [drop.active_stage, drop.next_stage].filter(s => s?.uuid).map(s => alertKey(drop, s)));
+  const existing = state.getStageWatches ? await state.getStageWatches(summaryKeys)
+    : new Map(await Promise.all(summaryKeys.map(async key => [key, await state.getStageWatch(key)])));
   const observations = new Map(drops.map(drop => [dropKey(drop), { drop, stages: [drop.active_stage, drop.next_stage] }]));
 
-  const relevantDrops = drops.filter(drop => [drop.active_stage, drop.next_stage].some(stage => stage?.uuid && initial.watchKeys.has(alertKey(drop, stage))));
+  const relevantDrops = drops.filter(drop => [drop.active_stage, drop.next_stage].some(stage => stage?.uuid && (existing.get(alertKey(drop, stage)) || eligible(drop, stage, config, nowSec))));
   const keys = relevantDrops.map(dropKey);
   const caches = await state.getCaches(keys);
   const due = relevantDrops
@@ -149,6 +198,7 @@ async function calendarScan({ api, state, config, env, nowSec, scanId, telegram 
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(detail.collection_slug);
     } catch (err) {
+      if (err.d1WriteFailure) throw err;
       if (err instanceof OpenSeaNotFound) {
         await state.markMiss(drop.collection_slug, nowSec);
       } else {
@@ -168,14 +218,20 @@ async function calendarScan({ api, state, config, env, nowSec, scanId, telegram 
     }
   });
 
-  const results = await processStages([...observations.values()], { state, env, nowSec, scanId, config, telegram });
+  for (const { drop, stages, authoritative } of observations.values()) {
+    if (!authoritative || isSoldOut(drop)) continue;
+    const present = new Set(stages.map(stage => stage.uuid));
+    for (const row of existing.values()) if (row && row.chain === String(drop.chain).toLowerCase()
+      && row.slug === drop.collection_slug && !present.has(row.stage_uuid)) await state.closeStageWatch(row.stage_key, nowSec);
+  }
+  const results = await processStages([...observations.values()], { state, env, nowSec, scanId, config, telegram, metrics });
   sent += results.alerts;
-  return { sent, warnings: initial.warnings + results.warnings, watched: initial.watched, details: due.length,
+  return { sent, warnings: results.warnings, watched: results.watched, details: due.length,
     pages: pages.reduce((sum, rows) => sum + (rows.pages || 0), 0),
     truncated: pages.some(rows => rows.truncated), summaries };
 }
 
-async function collectionSweep({ api, state, config, env, nowSec, summaries, scanId, telegram }) {
+async function collectionSweep({ api, state, config, env, nowSec, summaries, scanId, telegram, metrics }) {
   const raw = await state.getSetting("collection_sweep_at");
   const last = Number(raw || 0);
   if (nowSec - last < config.collectionSweepSeconds || config.maxFallbackDetails === 0) return { alerts: 0, warnings: 0, details: 0, watched: 0 };
@@ -218,6 +274,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
       await state.upsertCache(cacheRow(detail, nowSec, nowSec));
       await state.clearMiss(slug);
     } catch (err) {
+      if (err.d1WriteFailure) throw err;
       if (err instanceof OpenSeaNotFound) await state.markMiss(slug, nowSec);
       else console.warn(`fallback ${slug}: ${err.message}`);
     }
@@ -225,7 +282,7 @@ async function collectionSweep({ api, state, config, env, nowSec, summaries, sca
 
   await state.setSetting("collection_sweep_at", nowSec, nowSec);
 
-  const result = await processStages(observations, { state, env, nowSec, scanId, config, telegram });
+  const result = await processStages(observations, { state, env, nowSec, scanId, config, telegram, metrics });
   return { ...result, details: filtered.length };
 }
 
@@ -233,14 +290,15 @@ export async function runDiscoveryScan(env, deps = {}) {
   const config = getConfig(env);
   const nowSec = deps.nowSec ?? Math.floor(Date.now() / 1000);
   const scanId = String(Math.floor(nowSec / 60));
-  const state = deps.state || createState(env.DB);
+  const metrics = scanMetrics();
+  const state = scanState(env, deps, metrics);
   const api = deps.api || new Tide({ apiKey: env.OPENSEA_API_KEY });
 
   await maybeValidateChains({ api, state, config, nowSec });
-  const first = await calendarScan({ api, state, config, env, nowSec, scanId, telegram: deps.telegram });
-  const extra = await collectionSweep({ api, state, config, env, nowSec, summaries: first.summaries, scanId, telegram: deps.telegram });
-  console.log(`discovery: drops=${first.summaries.size} watched=${first.watched + extra.watched} details=${first.details + extra.details} alerts=${first.sent + extra.alerts} warnings=${first.warnings + extra.warnings} pages=${first.pages} truncated=${first.truncated}`);
-  return { alerts: first.sent + extra.alerts, warnings: first.warnings + extra.warnings, drops: first.summaries.size, pages: first.pages, truncated: first.truncated };
+  const first = await calendarScan({ api, state, config, env, nowSec, scanId, telegram: deps.telegram, metrics });
+  const extra = await collectionSweep({ api, state, config, env, nowSec, summaries: first.summaries, scanId, telegram: deps.telegram, metrics });
+  console.log(`discovery: ${Object.entries(metrics).map(([key, value]) => `${key}=${value}`).join(" ")} drops=${first.summaries.size} watched=${first.watched + extra.watched} details=${first.details + extra.details} alerts=${first.sent + extra.alerts} warnings=${first.warnings + extra.warnings} pages=${first.pages} truncated=${first.truncated}`);
+  return { alerts: first.sent + extra.alerts, warnings: first.warnings + extra.warnings, drops: first.summaries.size, pages: first.pages, truncated: first.truncated, ...metrics };
 }
 
 // Backwards-compatible programmatic discovery entry point.
@@ -250,7 +308,8 @@ export async function runWatchScan(env, deps = {}) {
   const config = getConfig(env);
   const nowSec = deps.nowSec ?? Math.floor(Date.now() / 1000);
   const scanId = String(Math.floor(nowSec / 60));
-  const state = deps.state || createState(env.DB);
+  const metrics = scanMetrics();
+  const state = scanState(env, deps, metrics);
   const api = deps.api || new Tide({ apiKey: env.OPENSEA_API_KEY });
   const candidates = await state.getWatchCandidates(nowSec, config);
   const groups = new Map();
@@ -264,6 +323,7 @@ export async function runWatchScan(env, deps = {}) {
   const selected = [...groups.values()].slice(0, config.maxWatchDetailsPerScan);
   await mapLimit(selected, 4, async rows => {
     try {
+      state.notePolled?.(rows, nowSec);
       const detail = await api.getDrop(rows[0].slug);
       if (String(detail.chain).toLowerCase() !== rows[0].chain) return;
       const ids = new Set(rows.map(row => row.stage_uuid));
@@ -272,9 +332,10 @@ export async function runWatchScan(env, deps = {}) {
         if (!present.has(row.stage_uuid)) await state.closeStageWatch(row.stage_key, nowSec);
       }
       const result = await processStages([{ drop: detail, stages: (detail.stages || []).filter(stage => ids.has(stage.uuid)), authoritative: true }],
-        { state, env, nowSec, scanId, config, telegram: deps.telegram });
+        { state, env, nowSec, scanId, config, telegram: deps.telegram, metrics });
       alerts += result.alerts; warnings += result.warnings;
     } catch (err) {
+      if (err.d1WriteFailure) throw err;
       if (err instanceof OpenSeaNotFound) {
         await state.closeCollectionWatches({ chain: rows[0].chain, collection_slug: rows[0].slug }, nowSec);
         console.log(`watch drop removed: ${rows[0].slug}`);
@@ -283,8 +344,8 @@ export async function runWatchScan(env, deps = {}) {
       }
     }
   });
-  console.log(`watch: candidates=${candidates.length} details=${selected.length} alerts=${alerts} warnings=${warnings}`);
-  return { candidates: candidates.length, details: selected.length, alerts, warnings };
+  console.log(`watch: ${Object.entries(metrics).map(([key, value]) => `${key}=${value}`).join(" ")} candidates=${candidates.length} details=${selected.length} alerts=${alerts} warnings=${warnings}`);
+  return { candidates: candidates.length, details: selected.length, alerts, warnings, ...metrics };
 }
 
 export function dispatchScheduled(controller, env, deps) {
